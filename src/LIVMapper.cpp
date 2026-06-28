@@ -12,6 +12,98 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 
+#include <cmath>
+#include <cstdint>
+#include <unordered_map>
+
+namespace {
+
+// Hash-based voxel key using int64_t to avoid PCL's int32 overflow
+struct VoxelKey {
+  int64_t x, y, z;
+
+  bool operator==(const VoxelKey& other) const {
+    return x == other.x && y == other.y && z == other.z;
+  }
+};
+
+// Efficient hash function (boost::hash_combine style).
+// 32-bit golden ratio constant: 0x9e3779b9U. Use the 64-bit constant
+// here because voxel coordinates are int64_t and size_t is 64-bit on target platforms.
+struct VoxelKeyHash {
+  size_t operator()(const VoxelKey& k) const {
+    constexpr uint64_t kHashCombine64 = 0x9e3779b97f4a7c15ULL;
+    size_t h = std::hash<int64_t>{}(k.x);
+    h ^= std::hash<int64_t>{}(k.y) + kHashCombine64 + (h << 6) + (h >> 2);
+    h ^= std::hash<int64_t>{}(k.z) + kHashCombine64 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+// Compact accumulator for voxel centroids
+struct VoxelAcc {
+  double x = 0, y = 0, z = 0, intensity = 0;
+  double nx = 0, ny = 0, nz = 0, curvature = 0;
+  uint32_t count = 0;
+
+  inline void add(const PointType& p) {
+    x += p.x; y += p.y; z += p.z;
+    intensity += p.intensity;
+    nx += p.normal_x; ny += p.normal_y; nz += p.normal_z;
+    curvature += p.curvature;
+    ++count;
+  }
+
+  inline PointType centroid() const {
+    const float inv = 1.0f / count;
+    PointType p;
+    p.x = x * inv; p.y = y * inv; p.z = z * inv;
+    p.intensity = intensity * inv;
+    p.normal_x = nx * inv; p.normal_y = ny * inv; p.normal_z = nz * inv;
+    p.curvature = curvature * inv;
+    return p;
+  }
+};
+
+// Hash-based voxel downsampling (no int32 overflow, faster than PCL)
+inline void hashVoxelDownsample(
+    const PointCloudXYZI::Ptr& in,
+    PointCloudXYZI::Ptr& out,
+    double leaf_size)
+{
+  out->clear();
+  if (!in || in->empty() || leaf_size <= 0) return;
+
+  const double inv_leaf = 1.0 / leaf_size;
+  std::unordered_map<VoxelKey, VoxelAcc, VoxelKeyHash> voxels;
+  voxels.reserve(in->size() / 5);  // Estimate ~20% points after downsampling
+
+  // Accumulate points into voxels
+  for (const auto& p : in->points) {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+      continue;
+
+    VoxelKey key{
+      static_cast<int64_t>(std::floor(p.x * inv_leaf)),
+      static_cast<int64_t>(std::floor(p.y * inv_leaf)),
+      static_cast<int64_t>(std::floor(p.z * inv_leaf))
+    };
+    voxels[key].add(p);
+  }
+
+  // Generate centroid point cloud
+  out->header = in->header;
+  out->is_dense = true;
+  out->points.reserve(voxels.size());
+  for (const auto& v : voxels) {
+    out->points.push_back(v.second.centroid());
+  }
+  out->width = out->size();
+  out->height = 1;
+}
+
+}  // namespace
+
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
       extR(M3D::Identity())
@@ -237,7 +329,7 @@ void LIVMapper::gravityAlignment()
     M3D G_R_I0 = G_q_I0.toRotationMatrix();
 
     _state.pos_end = G_R_I0 * _state.pos_end;
-    _state.rot_end = G_R_I0 * _state.rot_end;
+    _state.rot_end = NormalizeRotation(G_R_I0 * _state.rot_end);
     _state.vel_end = G_R_I0 * _state.vel_end;
     _state.gravity = G_R_I0 * _state.gravity;
     gravity_align_finished = true;
@@ -348,12 +440,13 @@ void LIVMapper::handleLIO()
 
   double t0 = omp_get_wtime();
 
-  downSizeFilterSurf.setInputCloud(feats_undistort);
-  downSizeFilterSurf.filter(*feats_down_body);
-  
+  // Use hash-based voxel downsampling (avoids PCL int32 overflow)
+  hashVoxelDownsample(feats_undistort, feats_down_body, filter_size_surf_min);
+
   double t_down = omp_get_wtime();
 
   feats_down_size = feats_down_body->points.size();
+  if (feats_down_size == 0) return;
   voxelmap_manager->feats_down_body_ = feats_down_body;
   transformLidar(_state.rot_end, _state.pos_end, feats_down_body, feats_down_world);
   voxelmap_manager->feats_down_world_ = feats_down_world;
@@ -561,7 +654,7 @@ void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D 
 
   M3D Exp_f = Exp(angvel_avr, dt);
   /* propogation of IMU attitude */
-  imu_prop_state.rot_end = imu_prop_state.rot_end * Exp_f;
+  imu_prop_state.rot_end = NormalizeRotation(imu_prop_state.rot_end * Exp_f);
 
   /* Specific acceleration (global frame) of IMU */
   V3D acc_imu = imu_prop_state.rot_end * acc_avr + V3D(imu_prop_state.gravity[0], imu_prop_state.gravity[1], imu_prop_state.gravity[2]);
@@ -662,7 +755,7 @@ void LIVMapper::pointBodyToWorld(const PointType &pi, PointType &po)
   po.intensity = pi.intensity;
 }
 
-template <typename T> void LIVMapper::pointBodyToWorld(const Matrix<T, 3, 1> &pi, Matrix<T, 3, 1> &po)
+template <typename T> void LIVMapper::pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po)
 {
   V3D p_body(pi[0], pi[1], pi[2]);
   V3D p_global(_state.rot_end * (extR * p_body + extT) + _state.pos_end);
@@ -671,11 +764,11 @@ template <typename T> void LIVMapper::pointBodyToWorld(const Matrix<T, 3, 1> &pi
   po[2] = p_global(2);
 }
 
-template <typename T> Matrix<T, 3, 1> LIVMapper::pointBodyToWorld(const Matrix<T, 3, 1> &pi)
+template <typename T> Eigen::Matrix<T, 3, 1> LIVMapper::pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi)
 {
   V3D p(pi[0], pi[1], pi[2]);
   p = (_state.rot_end * (extR * p + extT) + _state.pos_end);
-  Matrix<T, 3, 1> po(p[0], p[1], p[2]);
+  Eigen::Matrix<T, 3, 1> po(p[0], p[1], p[2]);
   return po;
 }
 

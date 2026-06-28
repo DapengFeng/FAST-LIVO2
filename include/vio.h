@@ -119,7 +119,7 @@ public:
   int frame_count = 0;
   bool plot_flag;
 
-  Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
+  Eigen::Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
   MatrixXd K, H_sub_inv;
 
   ofstream fout_camera, fout_colmap;

@@ -2,59 +2,42 @@
 #define SO3_MATH_H
 
 #include <Eigen/Core>
-#include <math.h>
+#include <sophus/rotation_matrix.hpp>
+#include <cmath>
 
 #define SKEW_SYM_MATRX(v) 0.0, -v[2], v[1], v[2], 0.0, -v[0], -v[1], v[0], 0.0
 
-template <typename T> Eigen::Matrix<T, 3, 3> Exp(const Eigen::Matrix<T, 3, 1> &&ang)
+template <typename Derived>
+Eigen::Matrix<typename Derived::Scalar, 3, 3> NormalizeRotation(const Eigen::MatrixBase<Derived> &R_expr)
 {
-  T ang_norm = ang.norm();
-  Eigen::Matrix<T, 3, 3> Eye3 = Eigen::Matrix<T, 3, 3>::Identity();
-  if (ang_norm > 0.0000001)
+  return Sophus::makeRotationMatrix(R_expr);
+}
+
+template <typename T> Eigen::Matrix<T, 3, 3> Exp(const Eigen::Matrix<T, 3, 1> &ang)
+{
+  const T ang_norm = ang.norm();
+  const Eigen::Matrix<T, 3, 3> Eye3 = Eigen::Matrix<T, 3, 3>::Identity();
+  Eigen::Matrix<T, 3, 3> K;
+  K << SKEW_SYM_MATRX(ang);
+
+  if (ang_norm > T(1e-7))
   {
-    Eigen::Matrix<T, 3, 1> r_axis = ang / ang_norm;
-    Eigen::Matrix<T, 3, 3> K;
-    K << SKEW_SYM_MATRX(r_axis);
-    /// Roderigous Tranformation
-    return Eye3 + std::sin(ang_norm) * K + (1.0 - std::cos(ang_norm)) * K * K;
+    const T sin_theta_by_theta = std::sin(ang_norm) / ang_norm;
+    const T one_minus_cos_by_theta2 = (T(1) - std::cos(ang_norm)) / (ang_norm * ang_norm);
+    return Eye3 + sin_theta_by_theta * K + one_minus_cos_by_theta2 * K * K;
   }
-  else { return Eye3; }
+
+  return Eye3 + K + T(0.5) * K * K;
 }
 
 template <typename T, typename Ts> Eigen::Matrix<T, 3, 3> Exp(const Eigen::Matrix<T, 3, 1> &ang_vel, const Ts &dt)
 {
-  T ang_vel_norm = ang_vel.norm();
-  Eigen::Matrix<T, 3, 3> Eye3 = Eigen::Matrix<T, 3, 3>::Identity();
-
-  if (ang_vel_norm > 0.0000001)
-  {
-    Eigen::Matrix<T, 3, 1> r_axis = ang_vel / ang_vel_norm;
-    Eigen::Matrix<T, 3, 3> K;
-
-    K << SKEW_SYM_MATRX(r_axis);
-
-    T r_ang = ang_vel_norm * dt;
-
-    /// Roderigous Tranformation
-    return Eye3 + std::sin(r_ang) * K + (1.0 - std::cos(r_ang)) * K * K;
-  }
-  else { return Eye3; }
+  return Exp(Eigen::Matrix<T, 3, 1>(ang_vel * dt));
 }
 
 template <typename T> Eigen::Matrix<T, 3, 3> Exp(const T &v1, const T &v2, const T &v3)
 {
-  T &&norm = sqrt(v1 * v1 + v2 * v2 + v3 * v3);
-  Eigen::Matrix<T, 3, 3> Eye3 = Eigen::Matrix<T, 3, 3>::Identity();
-  if (norm > 0.00001)
-  {
-    T r_ang[3] = {v1 / norm, v2 / norm, v3 / norm};
-    Eigen::Matrix<T, 3, 3> K;
-    K << SKEW_SYM_MATRX(r_ang);
-
-    /// Roderigous Tranformation
-    return Eye3 + std::sin(norm) * K + (1.0 - std::cos(norm)) * K * K;
-  }
-  else { return Eye3; }
+  return Exp(Eigen::Matrix<T, 3, 1>(v1, v2, v3));
 }
 
 /* Logrithm of a Rotation Matrix */

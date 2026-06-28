@@ -207,7 +207,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
   // std::cout << "cov_w:" << cov_w.diagonal().transpose() << std::endl;
   // std::cout << "after propagete:" << state_inout.cov.diagonal().transpose()
   //           << std::endl;
-  state_inout.rot_end = state_inout.rot_end * Exp_f;
+  state_inout.rot_end = NormalizeRotation(state_inout.rot_end * Exp_f);
   state_inout.pos_end = state_inout.pos_end + state_inout.vel_end * dt;
 
   if (lidar_type != L515)
@@ -439,7 +439,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   }
 
   state_inout.vel_end = vel_imu;
-  state_inout.rot_end = R_imu;
+  state_inout.rot_end = NormalizeRotation(R_imu);
   state_inout.pos_end = pos_imu;
   state_inout.inv_expo_time = tau;
 
