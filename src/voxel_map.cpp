@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
+#include <limits>
+
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
   if (pb[2] == 0) pb[2] = 0.0001;
@@ -645,21 +647,15 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   int max_layer = config_setting_.max_layer_;
   double voxel_size = config_setting_.max_voxel_size_;
   double sigma_num = config_setting_.sigma_num_;
-  std::mutex mylock;
   ptpl_list.clear();
-  std::vector<PointToPlane> all_ptpl_list(pv_list.size());
-  std::vector<bool> useful_ptpl(pv_list.size());
-  std::vector<size_t> index(pv_list.size());
-  for (size_t i = 0; i < index.size(); ++i)
-  {
-    index[i] = i;
-    useful_ptpl[i] = false;
-  }
+  const size_t point_count = pv_list.size();
+  std::vector<PointToPlane> all_ptpl_list(point_count);
+  std::vector<bool> useful_ptpl(point_count, false);
   #ifdef MP_EN
     omp_set_num_threads(MP_PROC_NUM);
     #pragma omp parallel for
   #endif
-  for (int i = 0; i < index.size(); i++)
+  for (int i = 0; i < static_cast<int>(point_count); i++)
   {
     pointWithVar &pv = pv_list[i];
     float loc_xyz[3];
@@ -675,8 +671,8 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       VoxelOctoTree *current_octo = iter->second;
       PointToPlane single_ptpl;
       bool is_sucess = false;
-      double prob = 0;
-      build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
+      double best_score = -std::numeric_limits<double>::infinity();
+      build_single_residual(pv, current_octo, 0, is_sucess, best_score, single_ptpl);
       if (!is_sucess)
       {
         VOXEL_LOCATION near_position = position;
@@ -687,60 +683,60 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
         if (loc_xyz[2] > (current_octo->voxel_center_[2] + current_octo->quater_length_)) { near_position.z = near_position.z + 1; }
         else if (loc_xyz[2] < (current_octo->voxel_center_[2] - current_octo->quater_length_)) { near_position.z = near_position.z - 1; }
         auto iter_near = voxel_map_.find(near_position);
-        if (iter_near != voxel_map_.end()) { build_single_residual(pv, iter_near->second, 0, is_sucess, prob, single_ptpl); }
+        if (iter_near != voxel_map_.end()) { build_single_residual(pv, iter_near->second, 0, is_sucess, best_score, single_ptpl); }
       }
       if (is_sucess)
       {
-        mylock.lock();
         useful_ptpl[i] = true;
         all_ptpl_list[i] = single_ptpl;
-        mylock.unlock();
       }
       else
       {
-        mylock.lock();
         useful_ptpl[i] = false;
-        mylock.unlock();
       }
     }
   }
-  for (size_t i = 0; i < useful_ptpl.size(); i++)
+  for (size_t i = 0; i < point_count; i++)
   {
     if (useful_ptpl[i]) { ptpl_list.push_back(all_ptpl_list[i]); }
   }
 }
 
 void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess,
-                                            double &prob, PointToPlane &single_ptpl)
+                                            double &best_score, PointToPlane &single_ptpl)
 {
   int max_layer = config_setting_.max_layer_;
   double sigma_num = config_setting_.sigma_num_;
 
   double radius_k = 3;
-  Eigen::Vector3d p_w = pv.point_w;
+  const Eigen::Vector3d &p_w = pv.point_w;
   if (current_octo->plane_ptr_->is_plane_)
   {
-    VoxelPlane &plane = *current_octo->plane_ptr_;
+    const VoxelPlane &plane = *current_octo->plane_ptr_;
     Eigen::Vector3d p_world_to_center = p_w - plane.center_;
-    float dis_to_plane = fabs(plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_);
-    float dis_to_center = (plane.center_(0) - p_w(0)) * (plane.center_(0) - p_w(0)) + (plane.center_(1) - p_w(1)) * (plane.center_(1) - p_w(1)) +
-                          (plane.center_(2) - p_w(2)) * (plane.center_(2) - p_w(2));
-    float range_dis = sqrt(dis_to_center - dis_to_plane * dis_to_plane);
+    double signed_dis_to_plane = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
+    double dis_to_plane = fabs(signed_dis_to_plane);
+    double dis_to_plane_sq = dis_to_plane * dis_to_plane;
+    double dis_to_center = p_world_to_center.squaredNorm();
+    double range_dis_sq = dis_to_center - dis_to_plane_sq;
+    if (range_dis_sq < 0) { return; }
+    double range_limit = radius_k * plane.radius_;
 
-    if (range_dis <= radius_k * plane.radius_)
+    if (range_dis_sq <= range_limit * range_limit)
     {
-      Eigen::Matrix<double, 1, 6> J_nq;
-      J_nq.block<1, 3>(0, 0) = p_w - plane.center_;
-      J_nq.block<1, 3>(0, 3) = -plane.normal_;
-      double sigma_l = J_nq * plane.plane_var_ * J_nq.transpose();
-      sigma_l += plane.normal_.transpose() * pv.var * plane.normal_;
-      if (dis_to_plane < sigma_num * sqrt(sigma_l))
+      Eigen::Matrix<double, 6, 1> J_nq;
+      J_nq.head<3>() = p_world_to_center;
+      J_nq.tail<3>() = -plane.normal_;
+      double sigma_l = J_nq.dot(plane.plane_var_ * J_nq);
+      sigma_l += plane.normal_.dot(pv.var * plane.normal_);
+      if (sigma_l <= 0) { return; }
+      if (dis_to_plane_sq < sigma_num * sigma_num * sigma_l)
       {
         is_sucess = true;
-        double this_prob = 1.0 / (sqrt(sigma_l)) * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
-        if (this_prob > prob)
+        double score = -0.5 * (dis_to_plane_sq / sigma_l + log(sigma_l));
+        if (score > best_score)
         {
-          prob = this_prob;
+          best_score = score;
           pv.normal = plane.normal_;
           single_ptpl.body_cov_ = pv.body_var;
           single_ptpl.point_b_ = pv.point_b;
@@ -750,7 +746,7 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
           single_ptpl.center_ = plane.center_;
           single_ptpl.d_ = plane.d_;
           single_ptpl.layer_ = current_layer;
-          single_ptpl.dis_to_plane_ = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
+          single_ptpl.dis_to_plane_ = signed_dis_to_plane;
         }
         return;
       }
@@ -776,7 +772,7 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
         {
 
           VoxelOctoTree *leaf_octo = current_octo->leaves_[leafnum];
-          build_single_residual(pv, leaf_octo, current_layer + 1, is_sucess, prob, single_ptpl);
+          build_single_residual(pv, leaf_octo, current_layer + 1, is_sucess, best_score, single_ptpl);
         }
       }
       return;

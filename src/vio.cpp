@@ -1457,7 +1457,7 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       const float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
       const float w_ref_br = subpix_u_ref * subpix_v_ref;
 
-      vector<float> P = visual_submap->warp_patch[i];
+      const vector<float> &P = visual_submap->warp_patch[i];
       for (int x = 0; x < patch_size; x++)
       {
         uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
@@ -1588,7 +1588,7 @@ void VIOManager::updateState(cv::Mat img, int level)
       float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
       float w_ref_br = subpix_u_ref * subpix_v_ref;
 
-      vector<float> P = visual_submap->warp_patch[i];
+      const vector<float> &P = visual_submap->warp_patch[i];
       double inv_ref_expo = visual_submap->inv_expo_list[i];
       // ROS_ERROR("inv_ref_expo: %.3lf, state->inv_expo_time: %.3lf\n", inv_ref_expo, state->inv_expo_time);
 
