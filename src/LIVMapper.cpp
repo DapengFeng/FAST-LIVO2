@@ -568,6 +568,23 @@ void LIVMapper::handleLIO()
   printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Average Total Time", aver_time_consu);
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
 
+  const ResidualBuildStats residual_stats = voxelmap_manager->last_residual_stats();
+  printf("[ALG_STATS] frame=%d raw_points=%zu down_points=%d residual_input=%zu residual_success=%zu success_rate=%.6f map_hits=%zu "
+         "primary_queries=%zu neighbor_queries=%zu neighbor_hits=%zu octree_nodes=%zu avg_nodes_per_input=%.6f plane_candidates=%zu "
+         "avg_planes_per_input=%.6f range_rejects=%zu sigma_rejects=%zu shadow_index_voxels=%zu shadow_index_planes=%zu "
+         "shadow_primary_queries=%zu shadow_primary_hits=%zu shadow_neighbor_queries=%zu shadow_neighbor_hits=%zu shadow_plane_candidates=%zu "
+         "shadow_avg_planes_per_input=%.6f shadow_success=%zu shadow_success_rate=%.6f shadow_matches_octree_success=%zu "
+         "shadow_coverage=%.6f shadow_range_rejects=%zu shadow_sigma_rejects=%zu downsample_time=%.6f icp_time=%.6f "
+         "update_map_time=%.6f total_time=%.6f\n",
+         frame_num, feats_undistort->points.size(), feats_down_size, residual_stats.input_points, residual_stats.residual_success,
+         residual_stats.successRate(), residual_stats.map_hits, residual_stats.primary_queries, residual_stats.neighbor_queries, residual_stats.neighbor_hits,
+         residual_stats.octree_nodes_visited, residual_stats.avgNodesPerInput(), residual_stats.plane_candidates, residual_stats.avgPlanesPerInput(),
+         residual_stats.plane_range_rejects, residual_stats.plane_sigma_rejects, residual_stats.shadow_index_voxels, residual_stats.shadow_index_planes,
+         residual_stats.shadow_primary_queries, residual_stats.shadow_primary_hits, residual_stats.shadow_neighbor_queries, residual_stats.shadow_neighbor_hits,
+         residual_stats.shadow_plane_candidates, residual_stats.shadowAvgPlanesPerInput(), residual_stats.shadow_success, residual_stats.shadowSuccessRate(),
+         residual_stats.shadow_matches_octree_success, residual_stats.shadowCoverageOfOctreeSuccess(), residual_stats.shadow_range_rejects,
+         residual_stats.shadow_sigma_rejects, t_down - t0, t2 - t1, t4 - t3, t4 - t0);
+
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "

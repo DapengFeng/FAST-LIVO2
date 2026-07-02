@@ -43,6 +43,8 @@ typedef struct VoxelMapConfig
   double beam_err_;
   double dept_err_;
   double sigma_num_;
+  double correspondence_rot_thresh_deg_;
+  double correspondence_pos_thresh_;
   bool is_pub_plane_map_;
 
   // config of local map sliding
@@ -50,6 +52,61 @@ typedef struct VoxelMapConfig
   bool map_sliding_en;
   int half_map_size;
 } VoxelMapConfig;
+
+struct ResidualBuildStats
+{
+  size_t input_points = 0;
+  size_t map_hits = 0;
+  size_t primary_queries = 0;
+  size_t neighbor_queries = 0;
+  size_t neighbor_hits = 0;
+  size_t octree_nodes_visited = 0;
+  size_t plane_candidates = 0;
+  size_t plane_range_rejects = 0;
+  size_t plane_sigma_rejects = 0;
+  size_t residual_success = 0;
+  size_t shadow_index_voxels = 0;
+  size_t shadow_index_planes = 0;
+  size_t shadow_primary_queries = 0;
+  size_t shadow_primary_hits = 0;
+  size_t shadow_neighbor_queries = 0;
+  size_t shadow_neighbor_hits = 0;
+  size_t shadow_plane_candidates = 0;
+  size_t shadow_range_rejects = 0;
+  size_t shadow_sigma_rejects = 0;
+  size_t shadow_success = 0;
+  size_t shadow_matches_octree_success = 0;
+
+  double successRate() const
+  {
+    return input_points > 0 ? static_cast<double>(residual_success) / static_cast<double>(input_points) : 0.0;
+  }
+
+  double avgNodesPerInput() const
+  {
+    return input_points > 0 ? static_cast<double>(octree_nodes_visited) / static_cast<double>(input_points) : 0.0;
+  }
+
+  double avgPlanesPerInput() const
+  {
+    return input_points > 0 ? static_cast<double>(plane_candidates) / static_cast<double>(input_points) : 0.0;
+  }
+
+  double shadowSuccessRate() const
+  {
+    return input_points > 0 ? static_cast<double>(shadow_success) / static_cast<double>(input_points) : 0.0;
+  }
+
+  double shadowAvgPlanesPerInput() const
+  {
+    return input_points > 0 ? static_cast<double>(shadow_plane_candidates) / static_cast<double>(input_points) : 0.0;
+  }
+
+  double shadowCoverageOfOctreeSuccess() const
+  {
+    return residual_success > 0 ? static_cast<double>(shadow_matches_octree_success) / static_cast<double>(residual_success) : 0.0;
+  }
+};
 
 typedef struct PointToPlane
 {
@@ -60,6 +117,7 @@ typedef struct PointToPlane
   Eigen::Matrix<double, 6, 6> plane_var_;
   M3D body_cov_;
   int layer_;
+  int point_index_ = -1;
   double d_;
   double eigen_value_;
   bool is_valid_;
@@ -216,6 +274,7 @@ public:
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;
   std::vector<PointToPlane> ptpl_list_;
+  ResidualBuildStats last_residual_stats_;
 
   VoxelMapManager(VoxelMapConfig &config_setting, std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &voxel_map)
       : config_setting_(config_setting), voxel_map_(voxel_map)
@@ -236,9 +295,13 @@ public:
   void UpdateVoxelMap(const std::vector<pointWithVar> &input_points);
 
   void BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list);
+  void ReuseResidualList(const std::vector<PointToPlane> &cached_ptpl_list, const pcl::PointCloud<pcl::PointXYZI>::Ptr &world_lidar,
+                         std::vector<PointToPlane> &ptpl_list);
 
   void build_single_residual(pointWithVar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess, double &best_score,
-                             PointToPlane &single_ptpl);
+                             PointToPlane &single_ptpl, ResidualBuildStats *stats = nullptr);
+
+  ResidualBuildStats last_residual_stats() const { return last_residual_stats_; }
 
   void pubVoxelMap();
 
@@ -246,6 +309,8 @@ public:
   void clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min );
 
 private:
+  bool evaluate_plane_residual(pointWithVar &pv, const VoxelPlane &plane, const int current_layer, bool &is_sucess, double &best_score,
+                               PointToPlane &single_ptpl, ResidualBuildStats *stats, const bool shadow_mode) const;
   void GetUpdatePlane(const VoxelOctoTree *current_octo, const int pub_max_voxel_layer, std::vector<VoxelPlane> &plane_list);
 
   void pubSinglePlane(visualization_msgs::MarkerArray &plane_pub, const std::string plane_ns, const VoxelPlane &single_plane, const float alpha,

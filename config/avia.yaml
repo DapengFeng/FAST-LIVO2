@@ -48,6 +48,8 @@ imu:
 
 lio:
   max_iterations: 5
+  correspondence_rot_thresh_deg: 0.5
+  correspondence_pos_thresh: 0.05
   dept_err: 0.02
   beam_err: 0.05
   min_eigen_value: 0.0025 # 0.005

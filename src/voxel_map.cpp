@@ -43,6 +43,8 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<double>("lio/voxel_size", voxel_config.max_voxel_size_, 0.5);
   nh.param<double>("lio/min_eigen_value", voxel_config.planner_threshold_, 0.01);
   nh.param<double>("lio/sigma_num", voxel_config.sigma_num_, 3);
+  nh.param<double>("lio/correspondence_rot_thresh_deg", voxel_config.correspondence_rot_thresh_deg_, 0.5);
+  nh.param<double>("lio/correspondence_pos_thresh", voxel_config.correspondence_pos_thresh_, 0.05);
   nh.param<double>("lio/beam_err", voxel_config.beam_err_, 0.02);
   nh.param<double>("lio/dept_err", voxel_config.dept_err_, 0.05);
   nh.param<vector<int>>("lio/layer_init_num", voxel_config.layer_init_num_, vector<int>{5,5,5,5,5});
@@ -371,6 +373,11 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   I_STATE.setIdentity();
 
   bool flg_EKF_inited, flg_EKF_converged, EKF_stop_flg = 0;
+  std::vector<PointToPlane> cached_ptpl_list;
+  M3D correspondence_rot = state_.rot_end;
+  V3D correspondence_pos = state_.pos_end;
+  const double correspondence_rot_thresh = std::sin(config_setting_.correspondence_rot_thresh_deg_ * M_PI / 180.0);
+  const double correspondence_pos_thresh = config_setting_.correspondence_pos_thresh_;
   for (int iterCount = 0; iterCount < config_setting_.max_iterations_; iterCount++)
   {
     double total_residual = 0.0;
@@ -394,7 +401,21 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
     // double t1 = omp_get_wtime();
 
-    BuildResidualListOMP(pv_list_, ptpl_list_);
+    const double rot_delta = (state_.rot_end - correspondence_rot).norm();
+    const double pos_delta = (state_.pos_end - correspondence_pos).norm();
+    const bool refresh_correspondence = iterCount == 0 || cached_ptpl_list.empty() ||
+                                        rot_delta > correspondence_rot_thresh || pos_delta > correspondence_pos_thresh;
+    if (refresh_correspondence)
+    {
+      BuildResidualListOMP(pv_list_, ptpl_list_);
+      cached_ptpl_list = ptpl_list_;
+      correspondence_rot = state_.rot_end;
+      correspondence_pos = state_.pos_end;
+    }
+    else
+    {
+      ReuseResidualList(cached_ptpl_list, world_lidar, ptpl_list_);
+    }
 
     // build_residual_time += omp_get_wtime() - t1;
 
@@ -642,21 +663,44 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   }
 }
 
+
+void VoxelMapManager::ReuseResidualList(const std::vector<PointToPlane> &cached_ptpl_list, const pcl::PointCloud<pcl::PointXYZI>::Ptr &world_lidar,
+                                        std::vector<PointToPlane> &ptpl_list)
+{
+  ptpl_list.clear();
+  ptpl_list.reserve(cached_ptpl_list.size());
+  const size_t point_count = world_lidar->points.size();
+  for (const PointToPlane &cached_ptpl : cached_ptpl_list)
+  {
+    if (cached_ptpl.point_index_ < 0 || static_cast<size_t>(cached_ptpl.point_index_) >= point_count) { continue; }
+    PointToPlane ptpl = cached_ptpl;
+    const pcl::PointXYZI &point_w = world_lidar->points[ptpl.point_index_];
+    ptpl.point_w_ << point_w.x, point_w.y, point_w.z;
+    ptpl.dis_to_plane_ = ptpl.normal_.dot(ptpl.point_w_) + ptpl.d_;
+    ptpl_list.push_back(ptpl);
+  }
+
+  last_residual_stats_ = ResidualBuildStats();
+  last_residual_stats_.input_points = point_count;
+  last_residual_stats_.residual_success = ptpl_list.size();
+}
+
 void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
 {
-  int max_layer = config_setting_.max_layer_;
   double voxel_size = config_setting_.max_voxel_size_;
-  double sigma_num = config_setting_.sigma_num_;
   ptpl_list.clear();
   const size_t point_count = pv_list.size();
   std::vector<PointToPlane> all_ptpl_list(point_count);
   std::vector<bool> useful_ptpl(point_count, false);
+  std::vector<ResidualBuildStats> per_point_stats(point_count);
   #ifdef MP_EN
     omp_set_num_threads(MP_PROC_NUM);
     #pragma omp parallel for
   #endif
   for (int i = 0; i < static_cast<int>(point_count); i++)
   {
+    ResidualBuildStats &point_stats = per_point_stats[i];
+    point_stats.input_points = 1;
     pointWithVar &pv = pv_list[i];
     float loc_xyz[3];
     for (int j = 0; j < 3; j++)
@@ -668,11 +712,13 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
+      point_stats.map_hits++;
+      point_stats.primary_queries++;
       VoxelOctoTree *current_octo = iter->second;
       PointToPlane single_ptpl;
       bool is_sucess = false;
       double best_score = -std::numeric_limits<double>::infinity();
-      build_single_residual(pv, current_octo, 0, is_sucess, best_score, single_ptpl);
+      build_single_residual(pv, current_octo, 0, is_sucess, best_score, single_ptpl, &point_stats);
       if (!is_sucess)
       {
         VOXEL_LOCATION near_position = position;
@@ -683,12 +729,19 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
         if (loc_xyz[2] > (current_octo->voxel_center_[2] + current_octo->quater_length_)) { near_position.z = near_position.z + 1; }
         else if (loc_xyz[2] < (current_octo->voxel_center_[2] - current_octo->quater_length_)) { near_position.z = near_position.z - 1; }
         auto iter_near = voxel_map_.find(near_position);
-        if (iter_near != voxel_map_.end()) { build_single_residual(pv, iter_near->second, 0, is_sucess, best_score, single_ptpl); }
+        point_stats.neighbor_queries++;
+        if (iter_near != voxel_map_.end())
+        {
+          point_stats.neighbor_hits++;
+          build_single_residual(pv, iter_near->second, 0, is_sucess, best_score, single_ptpl, &point_stats);
+        }
       }
       if (is_sucess)
       {
         useful_ptpl[i] = true;
+        single_ptpl.point_index_ = i;
         all_ptpl_list[i] = single_ptpl;
+        point_stats.residual_success = 1;
       }
       else
       {
@@ -696,71 +749,119 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       }
     }
   }
+  last_residual_stats_ = ResidualBuildStats();
   for (size_t i = 0; i < point_count; i++)
   {
     if (useful_ptpl[i]) { ptpl_list.push_back(all_ptpl_list[i]); }
+    const ResidualBuildStats &point_stats = per_point_stats[i];
+    last_residual_stats_.input_points += point_stats.input_points;
+    last_residual_stats_.map_hits += point_stats.map_hits;
+    last_residual_stats_.primary_queries += point_stats.primary_queries;
+    last_residual_stats_.neighbor_queries += point_stats.neighbor_queries;
+    last_residual_stats_.neighbor_hits += point_stats.neighbor_hits;
+    last_residual_stats_.octree_nodes_visited += point_stats.octree_nodes_visited;
+    last_residual_stats_.plane_candidates += point_stats.plane_candidates;
+    last_residual_stats_.plane_range_rejects += point_stats.plane_range_rejects;
+    last_residual_stats_.plane_sigma_rejects += point_stats.plane_sigma_rejects;
+    last_residual_stats_.residual_success += point_stats.residual_success;
   }
 }
 
+
+bool VoxelMapManager::evaluate_plane_residual(pointWithVar &pv, const VoxelPlane &plane, const int current_layer, bool &is_sucess,
+                                              double &best_score, PointToPlane &single_ptpl, ResidualBuildStats *stats,
+                                              const bool shadow_mode) const
+{
+  const double sigma_num = config_setting_.sigma_num_;
+  const double radius_k = 3;
+  const Eigen::Vector3d &p_w = pv.point_w;
+  if (stats != nullptr)
+  {
+    if (shadow_mode) { stats->shadow_plane_candidates++; }
+    else { stats->plane_candidates++; }
+  }
+
+  Eigen::Vector3d p_world_to_center = p_w - plane.center_;
+  double signed_dis_to_plane = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
+  double dis_to_plane = fabs(signed_dis_to_plane);
+  double dis_to_plane_sq = dis_to_plane * dis_to_plane;
+  double dis_to_center = p_world_to_center.squaredNorm();
+  double range_dis_sq = dis_to_center - dis_to_plane_sq;
+  if (range_dis_sq < 0)
+  {
+    if (stats != nullptr)
+    {
+      if (shadow_mode) { stats->shadow_range_rejects++; }
+      else { stats->plane_range_rejects++; }
+    }
+    return false;
+  }
+
+  double range_limit = radius_k * plane.radius_;
+  if (range_dis_sq > range_limit * range_limit)
+  {
+    if (stats != nullptr)
+    {
+      if (shadow_mode) { stats->shadow_range_rejects++; }
+      else { stats->plane_range_rejects++; }
+    }
+    return false;
+  }
+
+  Eigen::Matrix<double, 6, 1> J_nq;
+  J_nq.head<3>() = p_world_to_center;
+  J_nq.tail<3>() = -plane.normal_;
+  double sigma_l = J_nq.dot(plane.plane_var_ * J_nq);
+  sigma_l += plane.normal_.dot(pv.var * plane.normal_);
+  if (sigma_l <= 0)
+  {
+    if (stats != nullptr)
+    {
+      if (shadow_mode) { stats->shadow_sigma_rejects++; }
+      else { stats->plane_sigma_rejects++; }
+    }
+    return false;
+  }
+
+  if (dis_to_plane_sq >= sigma_num * sigma_num * sigma_l)
+  {
+    if (stats != nullptr)
+    {
+      if (shadow_mode) { stats->shadow_sigma_rejects++; }
+      else { stats->plane_sigma_rejects++; }
+    }
+    return false;
+  }
+
+  is_sucess = true;
+  double score = -0.5 * (dis_to_plane_sq / sigma_l + log(sigma_l));
+  if (score > best_score)
+  {
+    best_score = score;
+    pv.normal = plane.normal_;
+    single_ptpl.body_cov_ = pv.body_var;
+    single_ptpl.point_b_ = pv.point_b;
+    single_ptpl.point_w_ = pv.point_w;
+    single_ptpl.plane_var_ = plane.plane_var_;
+    single_ptpl.normal_ = plane.normal_;
+    single_ptpl.center_ = plane.center_;
+    single_ptpl.d_ = plane.d_;
+    single_ptpl.layer_ = current_layer;
+    single_ptpl.dis_to_plane_ = signed_dis_to_plane;
+  }
+  return true;
+}
+
 void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess,
-                                            double &best_score, PointToPlane &single_ptpl)
+                                            double &best_score, PointToPlane &single_ptpl, ResidualBuildStats *stats)
 {
   int max_layer = config_setting_.max_layer_;
-  double sigma_num = config_setting_.sigma_num_;
+  if (stats != nullptr) { stats->octree_nodes_visited++; }
 
-  double radius_k = 3;
-  const Eigen::Vector3d &p_w = pv.point_w;
   if (current_octo->plane_ptr_->is_plane_)
   {
-    const VoxelPlane &plane = *current_octo->plane_ptr_;
-    Eigen::Vector3d p_world_to_center = p_w - plane.center_;
-    double signed_dis_to_plane = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
-    double dis_to_plane = fabs(signed_dis_to_plane);
-    double dis_to_plane_sq = dis_to_plane * dis_to_plane;
-    double dis_to_center = p_world_to_center.squaredNorm();
-    double range_dis_sq = dis_to_center - dis_to_plane_sq;
-    if (range_dis_sq < 0) { return; }
-    double range_limit = radius_k * plane.radius_;
-
-    if (range_dis_sq <= range_limit * range_limit)
-    {
-      Eigen::Matrix<double, 6, 1> J_nq;
-      J_nq.head<3>() = p_world_to_center;
-      J_nq.tail<3>() = -plane.normal_;
-      double sigma_l = J_nq.dot(plane.plane_var_ * J_nq);
-      sigma_l += plane.normal_.dot(pv.var * plane.normal_);
-      if (sigma_l <= 0) { return; }
-      if (dis_to_plane_sq < sigma_num * sigma_num * sigma_l)
-      {
-        is_sucess = true;
-        double score = -0.5 * (dis_to_plane_sq / sigma_l + log(sigma_l));
-        if (score > best_score)
-        {
-          best_score = score;
-          pv.normal = plane.normal_;
-          single_ptpl.body_cov_ = pv.body_var;
-          single_ptpl.point_b_ = pv.point_b;
-          single_ptpl.point_w_ = pv.point_w;
-          single_ptpl.plane_var_ = plane.plane_var_;
-          single_ptpl.normal_ = plane.normal_;
-          single_ptpl.center_ = plane.center_;
-          single_ptpl.d_ = plane.d_;
-          single_ptpl.layer_ = current_layer;
-          single_ptpl.dis_to_plane_ = signed_dis_to_plane;
-        }
-        return;
-      }
-      else
-      {
-        // is_sucess = false;
-        return;
-      }
-    }
-    else
-    {
-      // is_sucess = false;
-      return;
-    }
+    evaluate_plane_residual(pv, *current_octo->plane_ptr_, current_layer, is_sucess, best_score, single_ptpl, stats, false);
+    return;
   }
   else
   {
@@ -772,7 +873,7 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
         {
 
           VoxelOctoTree *leaf_octo = current_octo->leaves_[leafnum];
-          build_single_residual(pv, leaf_octo, current_layer + 1, is_sucess, best_score, single_ptpl);
+          build_single_residual(pv, leaf_octo, current_layer + 1, is_sucess, best_score, single_ptpl, stats);
         }
       }
       return;
