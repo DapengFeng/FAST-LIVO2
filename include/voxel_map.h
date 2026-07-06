@@ -16,6 +16,8 @@ which is included as part of this source code package.
 #include "common_lib.h"
 #include <Eigen/Dense>
 #include <fstream>
+#include <cmath>
+#include <limits>
 #include <math.h>
 #include <mutex>
 #include <omp.h>
@@ -45,6 +47,26 @@ typedef struct VoxelMapConfig
   double sigma_num_;
   double correspondence_rot_thresh_deg_;
   double correspondence_pos_thresh_;
+  bool adaptive_correspondence_refresh_en_;
+  double adaptive_success_rate_drop_;
+  double adaptive_residual_ratio_;
+  bool info_eigen_log_en_;
+  bool saturation_priority_en_;
+  double saturation_priority_score_margin_;
+  bool plane_point_score_en_;
+  double plane_point_score_weight_;
+  bool adaptive_plane_point_score_en_;
+  double adaptive_plane_score_margin_;
+  double adaptive_plane_point_score_weight_;
+  int adaptive_plane_min_points_;
+  bool planarity_score_penalty_en_;
+  double planarity_score_penalty_thresh_;
+  double planarity_score_penalty_weight_;
+  bool use_planarity_ratio_;
+  double planarity_ratio_thresh_;
+  bool saif_gate_en_;
+  double saif_min_sqrt_info_;
+  double saif_min_weight_;
   bool is_pub_plane_map_;
 
   // config of local map sliding
@@ -76,6 +98,37 @@ struct ResidualBuildStats
   size_t shadow_sigma_rejects = 0;
   size_t shadow_success = 0;
   size_t shadow_matches_octree_success = 0;
+  size_t correspondence_refreshes = 0;
+  size_t correspondence_reuses = 0;
+  size_t adaptive_refreshes = 0;
+  size_t cache_reuse_samples = 0;
+  size_t selected_plane_points_sum = 0;
+  size_t selected_plane_samples = 0;
+  size_t priority_overrides = 0;
+  size_t plane_point_score_samples = 0;
+  size_t adaptive_plane_point_score_samples = 0;
+  size_t planarity_score_penalty_samples = 0;
+
+  double cache_reference_success_rate = 0.0;
+  double cache_reference_avg_residual = 0.0;
+  double cache_reuse_success_rate_sum = 0.0;
+  double cache_reuse_avg_residual_sum = 0.0;
+  double plane_point_score_bonus_sum = 0.0;
+  double adaptive_plane_point_score_bonus_sum = 0.0;
+  double planarity_score_penalty_sum = 0.0;
+  double lio_info_eig0 = 0.0;
+  double lio_info_eig1 = 0.0;
+  double lio_info_eig2 = 0.0;
+  double lio_info_eig3 = 0.0;
+  double lio_info_eig4 = 0.0;
+  double lio_info_eig5 = 0.0;
+  double lio_info_eig_min = 0.0;
+  double lio_info_eig_max = 0.0;
+  double lio_info_condition = 0.0;
+  int lio_info_weak_dir = -1;
+  size_t saif_gated_dirs = 0;
+  double saif_min_weight = 1.0;
+  double saif_weight_avg = 1.0;
 
   double successRate() const
   {
@@ -106,6 +159,87 @@ struct ResidualBuildStats
   {
     return residual_success > 0 ? static_cast<double>(shadow_matches_octree_success) / static_cast<double>(residual_success) : 0.0;
   }
+
+  double cacheReuseSuccessRateAvg() const
+  {
+    return cache_reuse_samples > 0 ? cache_reuse_success_rate_sum / static_cast<double>(cache_reuse_samples) : 0.0;
+  }
+
+  double cacheReuseAvgResidual() const
+  {
+    return cache_reuse_samples > 0 ? cache_reuse_avg_residual_sum / static_cast<double>(cache_reuse_samples) : 0.0;
+  }
+
+  double selectedPlanePointsAvg() const
+  {
+    return selected_plane_samples > 0 ? static_cast<double>(selected_plane_points_sum) / static_cast<double>(selected_plane_samples) : 0.0;
+  }
+
+  double planePointScoreBonusAvg() const
+  {
+    return plane_point_score_samples > 0 ? plane_point_score_bonus_sum / static_cast<double>(plane_point_score_samples) : 0.0;
+  }
+
+  double adaptivePlanePointScoreBonusAvg() const
+  {
+    return adaptive_plane_point_score_samples > 0
+               ? adaptive_plane_point_score_bonus_sum / static_cast<double>(adaptive_plane_point_score_samples)
+               : 0.0;
+  }
+
+  double planarityScorePenaltyAvg() const
+  {
+    return planarity_score_penalty_samples > 0 ? planarity_score_penalty_sum / static_cast<double>(planarity_score_penalty_samples) : 0.0;
+  }
+};
+
+struct PlaneBuildStats
+{
+  size_t evaluations = 0;
+  size_t accepted = 0;
+  size_t min_eigen_rejects = 0;
+  size_t ratio_rejects = 0;
+  size_t ratio_rejects_012 = 0;
+  size_t ratio_rejects_015 = 0;
+  size_t ratio_rejects_020 = 0;
+  double kappa_sum = 0.0;
+  double kappa_min = std::numeric_limits<double>::infinity();
+  double kappa_max = 0.0;
+  double accepted_kappa_sum = 0.0;
+  double ratio_rejected_kappa_sum = 0.0;
+  double min_eigen_sum = 0.0;
+  double min_eigen_min = std::numeric_limits<double>::infinity();
+  double min_eigen_max = 0.0;
+
+  double avgKappa() const
+  {
+    return evaluations > 0 ? kappa_sum / static_cast<double>(evaluations) : 0.0;
+  }
+
+  double avgAcceptedKappa() const
+  {
+    return accepted > 0 ? accepted_kappa_sum / static_cast<double>(accepted) : 0.0;
+  }
+
+  double avgRatioRejectedKappa() const
+  {
+    return ratio_rejects > 0 ? ratio_rejected_kappa_sum / static_cast<double>(ratio_rejects) : 0.0;
+  }
+
+  double avgMinEigen() const
+  {
+    return evaluations > 0 ? min_eigen_sum / static_cast<double>(evaluations) : 0.0;
+  }
+
+  double finiteKappaMin() const
+  {
+    return std::isfinite(kappa_min) ? kappa_min : 0.0;
+  }
+
+  double finiteMinEigenMin() const
+  {
+    return std::isfinite(min_eigen_min) ? min_eigen_min : 0.0;
+  }
 };
 
 typedef struct PointToPlane
@@ -118,6 +252,7 @@ typedef struct PointToPlane
   M3D body_cov_;
   int layer_;
   int point_index_ = -1;
+  int plane_points_size_ = 0;
   double d_;
   double eigen_value_;
   bool is_valid_;
@@ -198,6 +333,9 @@ public:
   std::vector<int> layer_init_num_;
   float quater_length_;
   float planer_threshold_;
+  bool use_planarity_ratio_;
+  float planarity_ratio_thresh_;
+  PlaneBuildStats *plane_build_stats_ = nullptr;
   int points_size_threshold_;
   int update_size_threshold_;
   int max_points_num_;
@@ -206,9 +344,11 @@ public:
   bool init_octo_;
   bool update_enable_;
 
-  VoxelOctoTree(int max_layer, int layer, int points_size_threshold, int max_points_num, float planer_threshold)
+  VoxelOctoTree(int max_layer, int layer, int points_size_threshold, int max_points_num, float planer_threshold,
+                bool use_planarity_ratio = false, float planarity_ratio_thresh = 0.05, PlaneBuildStats *plane_build_stats = nullptr)
       : max_layer_(max_layer), layer_(layer), points_size_threshold_(points_size_threshold), max_points_num_(max_points_num),
-        planer_threshold_(planer_threshold)
+        planer_threshold_(planer_threshold), use_planarity_ratio_(use_planarity_ratio), planarity_ratio_thresh_(planarity_ratio_thresh),
+        plane_build_stats_(plane_build_stats)
   {
     temp_points_.clear();
     octo_state_ = 0;
@@ -235,6 +375,7 @@ public:
   void init_octo_tree();
   void cut_octo_tree();
   void UpdateOctoTree(const pointWithVar &pv);
+  void set_plane_build_stats(PlaneBuildStats *stats);
 
   VoxelOctoTree *find_correspond(Eigen::Vector3d pw);
   VoxelOctoTree *Insert(const pointWithVar &pv);
@@ -275,6 +416,7 @@ public:
   std::vector<pointWithVar> pv_list_;
   std::vector<PointToPlane> ptpl_list_;
   ResidualBuildStats last_residual_stats_;
+  PlaneBuildStats last_plane_build_stats_;
 
   VoxelMapManager(VoxelMapConfig &config_setting, std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &voxel_map)
       : config_setting_(config_setting), voxel_map_(voxel_map)
@@ -302,6 +444,7 @@ public:
                              PointToPlane &single_ptpl, ResidualBuildStats *stats = nullptr);
 
   ResidualBuildStats last_residual_stats() const { return last_residual_stats_; }
+  PlaneBuildStats last_plane_build_stats() const { return last_plane_build_stats_; }
 
   void pubVoxelMap();
 

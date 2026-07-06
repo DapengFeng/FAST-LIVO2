@@ -14,6 +14,52 @@ which is included as part of this source code package.
 
 #include <limits>
 
+namespace
+{
+
+struct SaifGateStats
+{
+  size_t gated_dirs = 0;
+  double min_weight = 1.0;
+  double weight_sum = 0.0;
+};
+
+SaifGateStats applySaifGate(Eigen::Matrix<double, 6, 6> &info, Eigen::Matrix<double, 6, 1> &rhs, const double min_sqrt_info,
+                            const double min_weight)
+{
+  SaifGateStats stats;
+  stats.weight_sum = 6.0;
+  if (min_sqrt_info <= 0.0) return stats;
+
+  const Eigen::Matrix<double, 6, 6> sym_info = 0.5 * (info + info.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(sym_info);
+  if (solver.info() != Eigen::Success) return stats;
+
+  const Eigen::Matrix<double, 6, 1> eigs = solver.eigenvalues();
+  const Eigen::Matrix<double, 6, 6> eigvecs = solver.eigenvectors();
+  Eigen::Matrix<double, 6, 1> weights = Eigen::Matrix<double, 6, 1>::Ones();
+  stats.weight_sum = 0.0;
+  stats.min_weight = 1.0;
+  for (int i = 0; i < 6; ++i)
+  {
+    const double sqrt_info = std::sqrt(std::max(eigs(i), 0.0));
+    double weight = sqrt_info >= min_sqrt_info ? 1.0 : sqrt_info / min_sqrt_info;
+    weight = std::max(min_weight, std::min(1.0, weight));
+    weights(i) = weight;
+    stats.weight_sum += weight;
+    stats.min_weight = std::min(stats.min_weight, weight);
+    if (weight < 1.0) stats.gated_dirs++;
+  }
+
+  const Eigen::Matrix<double, 6, 6> gate = eigvecs * weights.array().square().matrix().asDiagonal() * eigvecs.transpose();
+  info = gate * sym_info;
+  info = 0.5 * (info + info.transpose());
+  rhs = gate * rhs;
+  return stats;
+}
+
+} // namespace
+
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
   if (pb[2] == 0) pb[2] = 0.0001;
@@ -45,6 +91,26 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<double>("lio/sigma_num", voxel_config.sigma_num_, 3);
   nh.param<double>("lio/correspondence_rot_thresh_deg", voxel_config.correspondence_rot_thresh_deg_, 0.5);
   nh.param<double>("lio/correspondence_pos_thresh", voxel_config.correspondence_pos_thresh_, 0.05);
+  nh.param<bool>("lio/adaptive_correspondence_refresh_en", voxel_config.adaptive_correspondence_refresh_en_, false);
+  nh.param<double>("lio/adaptive_success_rate_drop", voxel_config.adaptive_success_rate_drop_, 0.03);
+  nh.param<double>("lio/adaptive_residual_ratio", voxel_config.adaptive_residual_ratio_, 1.25);
+  nh.param<bool>("lio/info_eigen_log_en", voxel_config.info_eigen_log_en_, false);
+  nh.param<bool>("lio/saturation_priority_en", voxel_config.saturation_priority_en_, false);
+  nh.param<double>("lio/saturation_priority_score_margin", voxel_config.saturation_priority_score_margin_, 0.05);
+  nh.param<bool>("lio/plane_point_score_en", voxel_config.plane_point_score_en_, false);
+  nh.param<double>("lio/plane_point_score_weight", voxel_config.plane_point_score_weight_, 0.0);
+  nh.param<bool>("lio/adaptive_plane_point_score_en", voxel_config.adaptive_plane_point_score_en_, false);
+  nh.param<double>("lio/adaptive_plane_score_margin", voxel_config.adaptive_plane_score_margin_, 0.05);
+  nh.param<double>("lio/adaptive_plane_point_score_weight", voxel_config.adaptive_plane_point_score_weight_, 0.0);
+  nh.param<int>("lio/adaptive_plane_min_points", voxel_config.adaptive_plane_min_points_, 20);
+  nh.param<bool>("lio/planarity_score_penalty_en", voxel_config.planarity_score_penalty_en_, false);
+  nh.param<double>("lio/planarity_score_penalty_thresh", voxel_config.planarity_score_penalty_thresh_, 0.15);
+  nh.param<double>("lio/planarity_score_penalty_weight", voxel_config.planarity_score_penalty_weight_, 0.0);
+  nh.param<bool>("lio/use_planarity_ratio", voxel_config.use_planarity_ratio_, false);
+  nh.param<double>("lio/planarity_ratio_thresh", voxel_config.planarity_ratio_thresh_, 0.05);
+  nh.param<bool>("sa_livo/lio_saif_gate_en", voxel_config.saif_gate_en_, false);
+  nh.param<double>("sa_livo/lio_saif_min_sqrt_info", voxel_config.saif_min_sqrt_info_, 1.0);
+  nh.param<double>("sa_livo/lio_saif_min_weight", voxel_config.saif_min_weight_, 0.0);
   nh.param<double>("lio/beam_err", voxel_config.beam_err_, 0.02);
   nh.param<double>("lio/dept_err", voxel_config.dept_err_, 0.05);
   nh.param<vector<int>>("lio/layer_init_num", voxel_config.layer_init_num_, vector<int>{5,5,5,5,5});
@@ -87,7 +153,30 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
   J_Q << 1.0 / plane->points_size_, 0, 0, 0, 1.0 / plane->points_size_, 0, 0, 0, 1.0 / plane->points_size_;
   // && evalsReal(evalsMid) > 0.05
   //&& evalsReal(evalsMid) > 0.01
-  if (evalsReal(evalsMin) < planer_threshold_)
+  const double eval_sum = std::max(evalsReal.sum(), std::numeric_limits<double>::epsilon());
+  const double planarity_ratio = evalsReal(evalsMin) / eval_sum;
+  const bool min_eigen_accept = evalsReal(evalsMin) < planer_threshold_;
+  const bool ratio_accept = !use_planarity_ratio_ || planarity_ratio < planarity_ratio_thresh_;
+  if (plane_build_stats_ != nullptr)
+  {
+    plane_build_stats_->evaluations++;
+    plane_build_stats_->kappa_sum += planarity_ratio;
+    plane_build_stats_->kappa_min = std::min(plane_build_stats_->kappa_min, planarity_ratio);
+    plane_build_stats_->kappa_max = std::max(plane_build_stats_->kappa_max, planarity_ratio);
+    plane_build_stats_->min_eigen_sum += evalsReal(evalsMin);
+    plane_build_stats_->min_eigen_min = std::min(plane_build_stats_->min_eigen_min, static_cast<double>(evalsReal(evalsMin)));
+    plane_build_stats_->min_eigen_max = std::max(plane_build_stats_->min_eigen_max, static_cast<double>(evalsReal(evalsMin)));
+    if (!min_eigen_accept) { plane_build_stats_->min_eigen_rejects++; }
+    if (min_eigen_accept && planarity_ratio >= planarity_ratio_thresh_)
+    {
+      plane_build_stats_->ratio_rejects++;
+      plane_build_stats_->ratio_rejected_kappa_sum += planarity_ratio;
+    }
+    if (min_eigen_accept && planarity_ratio >= 0.12) { plane_build_stats_->ratio_rejects_012++; }
+    if (min_eigen_accept && planarity_ratio >= 0.15) { plane_build_stats_->ratio_rejects_015++; }
+    if (min_eigen_accept && planarity_ratio >= 0.20) { plane_build_stats_->ratio_rejects_020++; }
+  }
+  if (min_eigen_accept && ratio_accept)
   {
     for (int i = 0; i < points.size(); i++)
     {
@@ -124,6 +213,11 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
     plane->d_ = -(plane->normal_(0) * plane->center_(0) + plane->normal_(1) * plane->center_(1) + plane->normal_(2) * plane->center_(2));
     plane->is_plane_ = true;
     plane->is_update_ = true;
+    if (plane_build_stats_ != nullptr)
+    {
+      plane_build_stats_->accepted++;
+      plane_build_stats_->accepted_kappa_sum += planarity_ratio;
+    }
     if (!plane->is_init_)
     {
       plane->id_ = voxel_plane_id;
@@ -180,7 +274,8 @@ void VoxelOctoTree::cut_octo_tree()
     int leafnum = 4 * xyz[0] + 2 * xyz[1] + xyz[2];
     if (leaves_[leafnum] == nullptr)
     {
-      leaves_[leafnum] = new VoxelOctoTree(max_layer_, layer_ + 1, layer_init_num_[layer_ + 1], max_points_num_, planer_threshold_);
+      leaves_[leafnum] = new VoxelOctoTree(max_layer_, layer_ + 1, layer_init_num_[layer_ + 1], max_points_num_, planer_threshold_,
+                                           use_planarity_ratio_, planarity_ratio_thresh_, plane_build_stats_);
       leaves_[leafnum]->layer_init_num_ = layer_init_num_;
       leaves_[leafnum]->voxel_center_[0] = voxel_center_[0] + (2 * xyz[0] - 1) * quater_length_;
       leaves_[leafnum]->voxel_center_[1] = voxel_center_[1] + (2 * xyz[1] - 1) * quater_length_;
@@ -261,7 +356,8 @@ void VoxelOctoTree::UpdateOctoTree(const pointWithVar &pv)
         if (leaves_[leafnum] != nullptr) { leaves_[leafnum]->UpdateOctoTree(pv); }
         else
         {
-          leaves_[leafnum] = new VoxelOctoTree(max_layer_, layer_ + 1, layer_init_num_[layer_ + 1], max_points_num_, planer_threshold_);
+          leaves_[leafnum] = new VoxelOctoTree(max_layer_, layer_ + 1, layer_init_num_[layer_ + 1], max_points_num_, planer_threshold_,
+                                               use_planarity_ratio_, planarity_ratio_thresh_, plane_build_stats_);
           leaves_[leafnum]->layer_init_num_ = layer_init_num_;
           leaves_[leafnum]->voxel_center_[0] = voxel_center_[0] + (2 * xyz[0] - 1) * quater_length_;
           leaves_[leafnum]->voxel_center_[1] = voxel_center_[1] + (2 * xyz[1] - 1) * quater_length_;
@@ -290,6 +386,15 @@ void VoxelOctoTree::UpdateOctoTree(const pointWithVar &pv)
         }
       }
     }
+  }
+}
+
+void VoxelOctoTree::set_plane_build_stats(PlaneBuildStats *stats)
+{
+  plane_build_stats_ = stats;
+  for (int i = 0; i < 8; i++)
+  {
+    if (leaves_[i] != nullptr) { leaves_[i]->set_plane_build_stats(stats); }
   }
 }
 
@@ -327,7 +432,8 @@ VoxelOctoTree *VoxelOctoTree::Insert(const pointWithVar &pv)
     if (leaves_[leafnum] != nullptr) { return leaves_[leafnum]->Insert(pv); }
     else
     {
-      leaves_[leafnum] = new VoxelOctoTree(max_layer_, layer_ + 1, layer_init_num_[layer_ + 1], max_points_num_, planer_threshold_);
+      leaves_[leafnum] = new VoxelOctoTree(max_layer_, layer_ + 1, layer_init_num_[layer_ + 1], max_points_num_, planer_threshold_,
+                                           use_planarity_ratio_, planarity_ratio_thresh_, plane_build_stats_);
       leaves_[leafnum]->layer_init_num_ = layer_init_num_;
       leaves_[leafnum]->voxel_center_[0] = voxel_center_[0] + (2 * xyz[0] - 1) * quater_length_;
       leaves_[leafnum]->voxel_center_[1] = voxel_center_[1] + (2 * xyz[1] - 1) * quater_length_;
@@ -378,6 +484,31 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   V3D correspondence_pos = state_.pos_end;
   const double correspondence_rot_thresh = std::sin(config_setting_.correspondence_rot_thresh_deg_ * M_PI / 180.0);
   const double correspondence_pos_thresh = config_setting_.correspondence_pos_thresh_;
+  bool force_adaptive_refresh = false;
+  double cache_reference_success_rate = 0.0;
+  double cache_reference_avg_residual = 0.0;
+  size_t correspondence_refreshes = 0;
+  size_t correspondence_reuses = 0;
+  size_t adaptive_refreshes = 0;
+  size_t cache_reuse_samples = 0;
+  double cache_reuse_success_rate_sum = 0.0;
+  double cache_reuse_avg_residual_sum = 0.0;
+  size_t selected_plane_points_sum = 0;
+  size_t selected_plane_samples = 0;
+  size_t priority_overrides = 0;
+  size_t plane_point_score_samples = 0;
+  size_t adaptive_plane_point_score_samples = 0;
+  size_t planarity_score_penalty_samples = 0;
+  double plane_point_score_bonus_sum = 0.0;
+  double adaptive_plane_point_score_bonus_sum = 0.0;
+  double planarity_score_penalty_sum = 0.0;
+  Eigen::Matrix<double, 6, 1> lio_info_eigs = Eigen::Matrix<double, 6, 1>::Zero();
+  double lio_info_condition = 0.0;
+  int lio_info_weak_dir = -1;
+  size_t saif_gated_dirs = 0;
+  double saif_min_weight = 1.0;
+  double saif_weight_sum = 0.0;
+  size_t saif_samples = 0;
   for (int iterCount = 0; iterCount < config_setting_.max_iterations_; iterCount++)
   {
     double total_residual = 0.0;
@@ -403,17 +534,28 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
     const double rot_delta = (state_.rot_end - correspondence_rot).norm();
     const double pos_delta = (state_.pos_end - correspondence_pos).norm();
-    const bool refresh_correspondence = iterCount == 0 || cached_ptpl_list.empty() ||
+    const bool adaptive_refresh = force_adaptive_refresh;
+    const bool refresh_correspondence = iterCount == 0 || cached_ptpl_list.empty() || adaptive_refresh ||
                                         rot_delta > correspondence_rot_thresh || pos_delta > correspondence_pos_thresh;
+    force_adaptive_refresh = false;
     if (refresh_correspondence)
     {
+      correspondence_refreshes++;
+      if (adaptive_refresh) { adaptive_refreshes++; }
       BuildResidualListOMP(pv_list_, ptpl_list_);
+      plane_point_score_samples += last_residual_stats_.plane_point_score_samples;
+      plane_point_score_bonus_sum += last_residual_stats_.plane_point_score_bonus_sum;
+      adaptive_plane_point_score_samples += last_residual_stats_.adaptive_plane_point_score_samples;
+      adaptive_plane_point_score_bonus_sum += last_residual_stats_.adaptive_plane_point_score_bonus_sum;
+      planarity_score_penalty_samples += last_residual_stats_.planarity_score_penalty_samples;
+      planarity_score_penalty_sum += last_residual_stats_.planarity_score_penalty_sum;
       cached_ptpl_list = ptpl_list_;
       correspondence_rot = state_.rot_end;
       correspondence_pos = state_.pos_end;
     }
     else
     {
+      correspondence_reuses++;
       ReuseResidualList(cached_ptpl_list, world_lidar, ptpl_list_);
     }
 
@@ -424,8 +566,29 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       total_residual += fabs(ptpl_list_[i].dis_to_plane_);
     }
     effct_feat_num_ = ptpl_list_.size();
+    const double current_success_rate = feats_down_size_ > 0 ? static_cast<double>(effct_feat_num_) / static_cast<double>(feats_down_size_) : 0.0;
+    const double current_avg_residual = effct_feat_num_ > 0 ? total_residual / static_cast<double>(effct_feat_num_) : 0.0;
+    if (refresh_correspondence)
+    {
+      cache_reference_success_rate = current_success_rate;
+      cache_reference_avg_residual = current_avg_residual;
+    }
+    else
+    {
+      cache_reuse_samples++;
+      cache_reuse_success_rate_sum += current_success_rate;
+      cache_reuse_avg_residual_sum += current_avg_residual;
+      if (config_setting_.adaptive_correspondence_refresh_en_)
+      {
+        const bool success_rate_degraded =
+            cache_reference_success_rate > 0.0 && current_success_rate + config_setting_.adaptive_success_rate_drop_ < cache_reference_success_rate;
+        const bool residual_degraded = cache_reference_avg_residual > 0.0 &&
+                                       current_avg_residual > cache_reference_avg_residual * config_setting_.adaptive_residual_ratio_;
+        force_adaptive_refresh = success_rate_degraded || residual_degraded;
+      }
+    }
     cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
-         << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / effct_feat_num_ << endl;
+         << " effective feature num: " << effct_feat_num_ << " average residual: " << current_avg_residual << endl;
 
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
@@ -487,12 +650,36 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     auto &&HTz = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
+    Eigen::Matrix<double, 6, 6> pose_info = H_T_H.block<6, 6>(0, 0);
+    Eigen::Matrix<double, 6, 1> pose_rhs = HTz;
+    if (config_setting_.info_eigen_log_en_)
+    {
+      const Eigen::Matrix<double, 6, 6> lio_info = 0.5 * (pose_info + pose_info.transpose());
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> lio_info_solver(lio_info);
+      if (lio_info_solver.info() == Eigen::Success)
+      {
+        lio_info_eigs = lio_info_solver.eigenvalues();
+        lio_info_eigs.minCoeff(&lio_info_weak_dir);
+        const double eig_min_abs = std::max(std::abs(lio_info_eigs(0)), std::numeric_limits<double>::epsilon());
+        lio_info_condition = std::abs(lio_info_eigs(5)) / eig_min_abs;
+      }
+    }
+    if (config_setting_.saif_gate_en_)
+    {
+      const SaifGateStats saif_stats =
+          applySaifGate(pose_info, pose_rhs, config_setting_.saif_min_sqrt_info_, config_setting_.saif_min_weight_);
+      H_T_H.block<6, 6>(0, 0) = pose_info;
+      saif_gated_dirs += saif_stats.gated_dirs;
+      saif_min_weight = std::min(saif_min_weight, saif_stats.min_weight);
+      saif_weight_sum += saif_stats.weight_sum / 6.0;
+      saif_samples++;
+    }
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
     G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
     auto vec = state_propagat - state_;
     VD(DIM_STATE)
-    solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+    solution = K_1.block<DIM_STATE, 6>(0, 0) * pose_rhs + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
     int minRow, minCol;
     state_ += solution;
     auto rot_add = solution.block<3, 1>(0, 0);
@@ -521,6 +708,37 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     }
     if (EKF_stop_flg) break;
   }
+
+  last_residual_stats_.correspondence_refreshes = correspondence_refreshes;
+  last_residual_stats_.correspondence_reuses = correspondence_reuses;
+  last_residual_stats_.adaptive_refreshes = adaptive_refreshes;
+  last_residual_stats_.cache_reuse_samples = cache_reuse_samples;
+  last_residual_stats_.cache_reference_success_rate = cache_reference_success_rate;
+  last_residual_stats_.cache_reference_avg_residual = cache_reference_avg_residual;
+  last_residual_stats_.cache_reuse_success_rate_sum = cache_reuse_success_rate_sum;
+  last_residual_stats_.cache_reuse_avg_residual_sum = cache_reuse_avg_residual_sum;
+  last_residual_stats_.selected_plane_points_sum += selected_plane_points_sum;
+  last_residual_stats_.selected_plane_samples += selected_plane_samples;
+  last_residual_stats_.priority_overrides += priority_overrides;
+  last_residual_stats_.plane_point_score_samples += plane_point_score_samples;
+  last_residual_stats_.plane_point_score_bonus_sum += plane_point_score_bonus_sum;
+  last_residual_stats_.adaptive_plane_point_score_samples += adaptive_plane_point_score_samples;
+  last_residual_stats_.adaptive_plane_point_score_bonus_sum += adaptive_plane_point_score_bonus_sum;
+  last_residual_stats_.planarity_score_penalty_samples += planarity_score_penalty_samples;
+  last_residual_stats_.planarity_score_penalty_sum += planarity_score_penalty_sum;
+  last_residual_stats_.lio_info_eig0 = lio_info_eigs(0);
+  last_residual_stats_.lio_info_eig1 = lio_info_eigs(1);
+  last_residual_stats_.lio_info_eig2 = lio_info_eigs(2);
+  last_residual_stats_.lio_info_eig3 = lio_info_eigs(3);
+  last_residual_stats_.lio_info_eig4 = lio_info_eigs(4);
+  last_residual_stats_.lio_info_eig5 = lio_info_eigs(5);
+  last_residual_stats_.lio_info_eig_min = lio_info_eigs(0);
+  last_residual_stats_.lio_info_eig_max = lio_info_eigs(5);
+  last_residual_stats_.lio_info_condition = lio_info_condition;
+  last_residual_stats_.lio_info_weak_dir = lio_info_weak_dir;
+  last_residual_stats_.saif_gated_dirs = saif_gated_dirs;
+  last_residual_stats_.saif_min_weight = saif_min_weight;
+  last_residual_stats_.saif_weight_avg = saif_samples > 0 ? saif_weight_sum / static_cast<double>(saif_samples) : 1.0;
 
   // double t2 = omp_get_wtime();
   // scan_count++;
@@ -554,6 +772,7 @@ void VoxelMapManager::TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vec
 
 void VoxelMapManager::BuildVoxelMap()
 {
+  last_plane_build_stats_ = PlaneBuildStats();
   float voxel_size = config_setting_.max_voxel_size_;
   float planer_threshold = config_setting_.planner_threshold_;
   int max_layer = config_setting_.max_layer_;
@@ -596,7 +815,9 @@ void VoxelMapManager::BuildVoxelMap()
     }
     else
     {
-      VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
+      VoxelOctoTree *octo_tree =
+          new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold, config_setting_.use_planarity_ratio_,
+                            static_cast<float>(config_setting_.planarity_ratio_thresh_), &last_plane_build_stats_);
       voxel_map_[position] = octo_tree;
       voxel_map_[position]->quater_length_ = voxel_size / 4;
       voxel_map_[position]->voxel_center_[0] = (0.5 + position.x) * voxel_size;
@@ -631,6 +852,7 @@ V3F VoxelMapManager::RGBFromVoxel(const V3D &input_point)
 
 void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_points)
 {
+  last_plane_build_stats_ = PlaneBuildStats();
   float voxel_size = config_setting_.max_voxel_size_;
   float planer_threshold = config_setting_.planner_threshold_;
   int max_layer = config_setting_.max_layer_;
@@ -648,10 +870,15 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
     }
     VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
     auto iter = voxel_map_.find(position);
-    if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
+    if (iter != voxel_map_.end())
+    {
+      voxel_map_[position]->UpdateOctoTree(p_v);
+    }
     else
     {
-      VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
+      VoxelOctoTree *octo_tree =
+          new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold, config_setting_.use_planarity_ratio_,
+                            static_cast<float>(config_setting_.planarity_ratio_thresh_), &last_plane_build_stats_);
       voxel_map_[position] = octo_tree;
       voxel_map_[position]->layer_init_num_ = layer_init_num;
       voxel_map_[position]->quater_length_ = voxel_size / 4;
@@ -683,6 +910,14 @@ void VoxelMapManager::ReuseResidualList(const std::vector<PointToPlane> &cached_
   last_residual_stats_ = ResidualBuildStats();
   last_residual_stats_.input_points = point_count;
   last_residual_stats_.residual_success = ptpl_list.size();
+  for (const PointToPlane &ptpl : ptpl_list)
+  {
+    if (ptpl.plane_points_size_ > 0)
+    {
+      last_residual_stats_.selected_plane_points_sum += static_cast<size_t>(ptpl.plane_points_size_);
+      last_residual_stats_.selected_plane_samples++;
+    }
+  }
 }
 
 void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
@@ -742,6 +977,11 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
         single_ptpl.point_index_ = i;
         all_ptpl_list[i] = single_ptpl;
         point_stats.residual_success = 1;
+        if (single_ptpl.plane_points_size_ > 0)
+        {
+          point_stats.selected_plane_points_sum = static_cast<size_t>(single_ptpl.plane_points_size_);
+          point_stats.selected_plane_samples = 1;
+        }
       }
       else
       {
@@ -764,6 +1004,15 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
     last_residual_stats_.plane_range_rejects += point_stats.plane_range_rejects;
     last_residual_stats_.plane_sigma_rejects += point_stats.plane_sigma_rejects;
     last_residual_stats_.residual_success += point_stats.residual_success;
+    last_residual_stats_.selected_plane_points_sum += point_stats.selected_plane_points_sum;
+    last_residual_stats_.selected_plane_samples += point_stats.selected_plane_samples;
+    last_residual_stats_.priority_overrides += point_stats.priority_overrides;
+    last_residual_stats_.plane_point_score_samples += point_stats.plane_point_score_samples;
+    last_residual_stats_.plane_point_score_bonus_sum += point_stats.plane_point_score_bonus_sum;
+    last_residual_stats_.adaptive_plane_point_score_samples += point_stats.adaptive_plane_point_score_samples;
+    last_residual_stats_.adaptive_plane_point_score_bonus_sum += point_stats.adaptive_plane_point_score_bonus_sum;
+    last_residual_stats_.planarity_score_penalty_samples += point_stats.planarity_score_penalty_samples;
+    last_residual_stats_.planarity_score_penalty_sum += point_stats.planarity_score_penalty_sum;
   }
 }
 
@@ -835,9 +1084,51 @@ bool VoxelMapManager::evaluate_plane_residual(pointWithVar &pv, const VoxelPlane
 
   is_sucess = true;
   double score = -0.5 * (dis_to_plane_sq / sigma_l + log(sigma_l));
-  if (score > best_score)
+  if (config_setting_.plane_point_score_en_ && config_setting_.plane_point_score_weight_ != 0.0)
   {
-    best_score = score;
+    const double bonus = config_setting_.plane_point_score_weight_ * log1p(static_cast<double>(std::max(plane.points_size_, 0)));
+    score += bonus;
+    if (stats != nullptr && !shadow_mode)
+    {
+      stats->plane_point_score_samples++;
+      stats->plane_point_score_bonus_sum += bonus;
+    }
+  }
+  if (config_setting_.adaptive_plane_point_score_en_ && config_setting_.adaptive_plane_point_score_weight_ != 0.0 &&
+      plane.points_size_ >= config_setting_.adaptive_plane_min_points_ && std::isfinite(best_score) &&
+      score + config_setting_.adaptive_plane_score_margin_ > best_score)
+  {
+    const double bonus =
+        config_setting_.adaptive_plane_point_score_weight_ * log1p(static_cast<double>(std::max(plane.points_size_, 0)));
+    score += bonus;
+    if (stats != nullptr && !shadow_mode)
+    {
+      stats->adaptive_plane_point_score_samples++;
+      stats->adaptive_plane_point_score_bonus_sum += bonus;
+    }
+  }
+  if (config_setting_.planarity_score_penalty_en_ && config_setting_.planarity_score_penalty_weight_ != 0.0)
+  {
+    const double eigen_sum = std::max(static_cast<double>(plane.min_eigen_value_ + plane.mid_eigen_value_ + plane.max_eigen_value_),
+                                      std::numeric_limits<double>::epsilon());
+    const double kappa = static_cast<double>(plane.min_eigen_value_) / eigen_sum;
+    const double excess = std::max(0.0, kappa - config_setting_.planarity_score_penalty_thresh_);
+    const double penalty = config_setting_.planarity_score_penalty_weight_ * excess;
+    score -= penalty;
+    if (stats != nullptr && !shadow_mode && penalty > 0.0)
+    {
+      stats->planarity_score_penalty_samples++;
+      stats->planarity_score_penalty_sum += penalty;
+    }
+  }
+  const bool score_is_better = score > best_score;
+  const bool priority_override = config_setting_.saturation_priority_en_ && !score_is_better &&
+                                 score + config_setting_.saturation_priority_score_margin_ > best_score &&
+                                 plane.points_size_ > single_ptpl.plane_points_size_;
+  if (score_is_better || priority_override)
+  {
+    if (priority_override && stats != nullptr && !shadow_mode) { stats->priority_overrides++; }
+    if (score_is_better) { best_score = score; }
     pv.normal = plane.normal_;
     single_ptpl.body_cov_ = pv.body_var;
     single_ptpl.point_b_ = pv.point_b;
@@ -848,6 +1139,7 @@ bool VoxelMapManager::evaluate_plane_residual(pointWithVar &pv, const VoxelPlane
     single_ptpl.d_ = plane.d_;
     single_ptpl.layer_ = current_layer;
     single_ptpl.dis_to_plane_ = signed_dis_to_plane;
+    single_ptpl.plane_points_size_ = plane.points_size_;
   }
   return true;
 }

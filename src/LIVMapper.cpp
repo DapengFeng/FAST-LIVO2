@@ -155,6 +155,9 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("vio/raycast_en", raycast_en, false);
   nh.param<bool>("vio/exposure_estimate_en", exposure_estimate_en, true);
   nh.param<double>("vio/inv_expo_cov", inv_expo_cov, 0.2);
+  nh.param<bool>("sa_livo/vio_saif_gate_en", vio_saif_gate_en, false);
+  nh.param<double>("sa_livo/vio_saif_min_sqrt_info", vio_saif_min_sqrt_info, 1.0);
+  nh.param<double>("sa_livo/vio_saif_min_weight", vio_saif_min_weight, 0.0);
   nh.param<int>("vio/grid_size", grid_size, 5);
   nh.param<int>("vio/grid_n_height", grid_n_height, 17);
   nh.param<int>("vio/patch_pyrimid_level", patch_pyrimid_level, 3);
@@ -230,6 +233,9 @@ void LIVMapper::initializeComponents()
   vio_manager->img_point_cov = IMG_POINT_COV;
   vio_manager->normal_en = normal_en;
   vio_manager->inverse_composition_en = inverse_composition_en;
+  vio_manager->saif_gate_en = vio_saif_gate_en;
+  vio_manager->saif_min_sqrt_info = vio_saif_min_sqrt_info;
+  vio_manager->saif_min_weight = vio_saif_min_weight;
   vio_manager->raycast_en = raycast_en;
   vio_manager->grid_n_width = grid_n_width;
   vio_manager->grid_n_height = grid_n_height;
@@ -569,13 +575,27 @@ void LIVMapper::handleLIO()
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
 
   const ResidualBuildStats residual_stats = voxelmap_manager->last_residual_stats();
+  const PlaneBuildStats plane_stats = voxelmap_manager->last_plane_build_stats();
   printf("[ALG_STATS] frame=%d | points raw_points=%zu down_points=%d residual_input=%zu residual_success=%zu success_rate=%.6f "
          "| search map_hits=%zu primary_queries=%zu neighbor_queries=%zu neighbor_hits=%zu octree_nodes=%zu avg_nodes_per_input=%.6f "
          "plane_candidates=%zu avg_planes_per_input=%.6f | rejects range_rejects=%zu sigma_rejects=%zu "
          "| shadow shadow_index_voxels=%zu shadow_index_planes=%zu shadow_primary_queries=%zu shadow_primary_hits=%zu "
          "shadow_neighbor_queries=%zu shadow_neighbor_hits=%zu shadow_plane_candidates=%zu shadow_avg_planes_per_input=%.6f "
          "shadow_success=%zu shadow_success_rate=%.6f shadow_matches_octree_success=%zu shadow_coverage=%.6f "
-         "shadow_range_rejects=%zu shadow_sigma_rejects=%zu | timing downsample_time=%.6f icp_time=%.6f "
+         "shadow_range_rejects=%zu shadow_sigma_rejects=%zu | cache correspondence_refreshes=%zu correspondence_reuses=%zu "
+         "adaptive_refreshes=%zu cache_reference_success_rate=%.6f cache_reference_avg_residual=%.6f "
+         "cache_reuse_success_rate=%.6f cache_reuse_avg_residual=%.6f | plane selected_plane_points_avg=%.6f "
+         "priority_overrides=%zu plane_point_score_samples=%zu plane_point_score_bonus_avg=%.6e "
+         "adaptive_plane_point_score_samples=%zu adaptive_plane_point_score_bonus_avg=%.6e "
+         "planarity_score_penalty_samples=%zu planarity_score_penalty_avg=%.6e "
+         "plane_evaluations=%zu plane_accepted=%zu plane_min_eigen_rejects=%zu "
+         "plane_ratio_rejects=%zu plane_ratio_rejects_012=%zu plane_ratio_rejects_015=%zu plane_ratio_rejects_020=%zu "
+         "plane_kappa_avg=%.6e plane_kappa_min=%.6e plane_kappa_max=%.6e "
+         "plane_accepted_kappa_avg=%.6e plane_ratio_rejected_kappa_avg=%.6e plane_min_eigen_avg=%.6e "
+         "plane_min_eigen_min=%.6e plane_min_eigen_max=%.6e | info eig0=%.6e eig1=%.6e eig2=%.6e "
+         "eig3=%.6e eig4=%.6e eig5=%.6e eig_min=%.6e eig_max=%.6e info_condition=%.6e weak_dir=%d "
+         "| saif lio_saif_enabled=%d lio_saif_gated_dirs=%zu lio_saif_min_weight=%.6f lio_saif_weight_avg=%.6f "
+         "| timing downsample_time=%.6f icp_time=%.6f "
          "update_map_time=%.6f total_time=%.6f\n",
          frame_num, feats_undistort->points.size(), feats_down_size, residual_stats.input_points, residual_stats.residual_success,
          residual_stats.successRate(), residual_stats.map_hits, residual_stats.primary_queries, residual_stats.neighbor_queries, residual_stats.neighbor_hits,
@@ -584,7 +604,22 @@ void LIVMapper::handleLIO()
          residual_stats.shadow_primary_queries, residual_stats.shadow_primary_hits, residual_stats.shadow_neighbor_queries, residual_stats.shadow_neighbor_hits,
          residual_stats.shadow_plane_candidates, residual_stats.shadowAvgPlanesPerInput(), residual_stats.shadow_success, residual_stats.shadowSuccessRate(),
          residual_stats.shadow_matches_octree_success, residual_stats.shadowCoverageOfOctreeSuccess(), residual_stats.shadow_range_rejects,
-         residual_stats.shadow_sigma_rejects, t_down - t0, t2 - t1, t4 - t3, t4 - t0);
+         residual_stats.shadow_sigma_rejects, residual_stats.correspondence_refreshes, residual_stats.correspondence_reuses,
+         residual_stats.adaptive_refreshes, residual_stats.cache_reference_success_rate, residual_stats.cache_reference_avg_residual,
+         residual_stats.cacheReuseSuccessRateAvg(), residual_stats.cacheReuseAvgResidual(), residual_stats.selectedPlanePointsAvg(),
+         residual_stats.priority_overrides, residual_stats.plane_point_score_samples, residual_stats.planePointScoreBonusAvg(),
+         residual_stats.adaptive_plane_point_score_samples, residual_stats.adaptivePlanePointScoreBonusAvg(),
+         residual_stats.planarity_score_penalty_samples, residual_stats.planarityScorePenaltyAvg(),
+         plane_stats.evaluations, plane_stats.accepted, plane_stats.min_eigen_rejects,
+         plane_stats.ratio_rejects, plane_stats.ratio_rejects_012, plane_stats.ratio_rejects_015, plane_stats.ratio_rejects_020,
+         plane_stats.avgKappa(), plane_stats.finiteKappaMin(), plane_stats.kappa_max, plane_stats.avgAcceptedKappa(), plane_stats.avgRatioRejectedKappa(),
+         plane_stats.avgMinEigen(), plane_stats.finiteMinEigenMin(), plane_stats.min_eigen_max,
+         residual_stats.lio_info_eig0, residual_stats.lio_info_eig1,
+         residual_stats.lio_info_eig2, residual_stats.lio_info_eig3, residual_stats.lio_info_eig4, residual_stats.lio_info_eig5,
+         residual_stats.lio_info_eig_min, residual_stats.lio_info_eig_max, residual_stats.lio_info_condition, residual_stats.lio_info_weak_dir,
+         voxelmap_manager->config_setting_.saif_gate_en_ ? 1 : 0, residual_stats.saif_gated_dirs, residual_stats.saif_min_weight,
+         residual_stats.saif_weight_avg,
+         t_down - t0, t2 - t1, t4 - t3, t4 - t0);
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "

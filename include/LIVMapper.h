@@ -110,6 +110,9 @@ public:
   bool exposure_estimate_en = false;
   double exposure_time_init = 0.0;
   bool inverse_composition_en = false;
+  bool vio_saif_gate_en = false;
+  double vio_saif_min_sqrt_info = 1.0;
+  double vio_saif_min_weight = 0.0;
   bool raycast_en = false;
   int lidar_en = 1;
   bool is_first_frame = false;

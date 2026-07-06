@@ -12,6 +12,52 @@ which is included as part of this source code package.
 
 #include "vio.h"
 
+namespace
+{
+
+struct SaifGateStats
+{
+  size_t gated_dirs = 0;
+  double min_weight = 1.0;
+  double weight_sum = 0.0;
+};
+
+SaifGateStats applySaifGate(Eigen::Matrix<double, 6, 6> &info, Eigen::Matrix<double, 6, 1> &rhs, const double min_sqrt_info,
+                            const double min_weight)
+{
+  SaifGateStats stats;
+  stats.weight_sum = 6.0;
+  if (min_sqrt_info <= 0.0) return stats;
+
+  const Eigen::Matrix<double, 6, 6> sym_info = 0.5 * (info + info.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(sym_info);
+  if (solver.info() != Eigen::Success) return stats;
+
+  const Eigen::Matrix<double, 6, 1> eigs = solver.eigenvalues();
+  const Eigen::Matrix<double, 6, 6> eigvecs = solver.eigenvectors();
+  Eigen::Matrix<double, 6, 1> weights = Eigen::Matrix<double, 6, 1>::Ones();
+  stats.weight_sum = 0.0;
+  stats.min_weight = 1.0;
+  for (int i = 0; i < 6; ++i)
+  {
+    const double sqrt_info = std::sqrt(std::max(eigs(i), 0.0));
+    double weight = sqrt_info >= min_sqrt_info ? 1.0 : sqrt_info / min_sqrt_info;
+    weight = std::max(min_weight, std::min(1.0, weight));
+    weights(i) = weight;
+    stats.weight_sum += weight;
+    stats.min_weight = std::min(stats.min_weight, weight);
+    if (weight < 1.0) stats.gated_dirs++;
+  }
+
+  const Eigen::Matrix<double, 6, 6> gate = eigvecs * weights.array().square().matrix().asDiagonal() * eigvecs.transpose();
+  info = gate * sym_info;
+  info = 0.5 * (info + info.transpose());
+  rhs = gate * rhs;
+  return stats;
+}
+
+} // namespace
+
 VIOManager::VIOManager()
 {
   // downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
@@ -783,9 +829,13 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 
 void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
 {
-  if (total_points == 0) return;
-  
   compute_jacobian_time = update_ekf_time = 0.0;
+  saif_gated_dirs = 0;
+  saif_frame_min_weight = 1.0;
+  saif_frame_weight_avg = 1.0;
+  saif_frame_weight_sum = 0.0;
+  saif_frame_samples = 0;
+  if (total_points == 0) return;
 
   for (int level = patch_pyrimid_level - 1; level >= 0; level--)
   {
@@ -797,36 +847,73 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
     else
       updateState(img, level);
   }
+  if (saif_frame_samples > 0) saif_frame_weight_avg = saif_frame_weight_sum / static_cast<double>(saif_frame_samples);
   state->cov -= G * state->cov;
   updateFrameState(*state);
 }
 
 void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
 {
+  vio_map_pg_size = pg.size();
+  vio_map_normal_zero = 0;
+  vio_map_in_frame = 0;
+  vio_map_grid_map_skip = 0;
+  vio_map_selected_from_scan = 0;
+  vio_map_voxel_candidates = visual_submap->add_from_voxel_map.size();
+  vio_map_selected_from_voxel = 0;
+  vio_map_added = 0;
+  vio_map_depth_positive = 0;
+  vio_map_shi_max = 0.0;
+  vio_map_u_min = std::numeric_limits<double>::max();
+  vio_map_u_max = std::numeric_limits<double>::lowest();
+  vio_map_v_min = std::numeric_limits<double>::max();
+  vio_map_v_max = std::numeric_limits<double>::lowest();
+  vio_map_z_min = std::numeric_limits<double>::max();
+  vio_map_z_max = std::numeric_limits<double>::lowest();
+
   if (pg.size() <= 10) return;
 
   // double t0 = omp_get_wtime();
   for (int i = 0; i < pg.size(); i++)
   {
-    if (pg[i].normal == V3D(0, 0, 0)) continue;
+    if (pg[i].normal == V3D(0, 0, 0))
+    {
+      vio_map_normal_zero++;
+      continue;
+    }
 
     V3D pt = pg[i].point_w;
+    const V3D pf = new_frame_->w2f(pt);
+    vio_map_z_min = std::min(vio_map_z_min, pf[2]);
+    vio_map_z_max = std::max(vio_map_z_max, pf[2]);
+    if (pf[2] > 0.0) vio_map_depth_positive++;
     V2D pc(new_frame_->w2c(pt));
+    vio_map_u_min = std::min(vio_map_u_min, pc[0]);
+    vio_map_u_max = std::max(vio_map_u_max, pc[0]);
+    vio_map_v_min = std::min(vio_map_v_min, pc[1]);
+    vio_map_v_max = std::max(vio_map_v_max, pc[1]);
 
     if (new_frame_->cam_->isInFrame(pc.cast<int>(), border)) // 20px is the patch size in the matcher
     {
+      vio_map_in_frame++;
       int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
 
       if (grid_num[index] != TYPE_MAP)
       {
         float cur_value = vk::shiTomasiScore(img, pc[0], pc[1]);
+        vio_map_shi_max = std::max(vio_map_shi_max, static_cast<double>(cur_value));
         // if (cur_value < 5) continue;
         if (cur_value > scan_value[index])
         {
           scan_value[index] = cur_value;
           append_voxel_points[index] = pg[i];
           grid_num[index] = TYPE_POINTCLOUD;
+          vio_map_selected_from_scan++;
         }
+      }
+      else
+      {
+        vio_map_grid_map_skip++;
       }
     }
   }
@@ -843,12 +930,18 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
       if (grid_num[index] != TYPE_MAP)
       {
         float cur_value = vk::shiTomasiScore(img, pc[0], pc[1]);
+        vio_map_shi_max = std::max(vio_map_shi_max, static_cast<double>(cur_value));
         if (cur_value > scan_value[index])
         {
           scan_value[index] = cur_value;
           append_voxel_points[index] = visual_submap->add_from_voxel_map[j];
           grid_num[index] = TYPE_POINTCLOUD;
+          vio_map_selected_from_voxel++;
         }
+      }
+      else
+      {
+        vio_map_grid_map_skip++;
       }
     }
   }
@@ -896,10 +989,21 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
       // map_cur_frame.push_back(pt_new);
     }
   }
+  vio_map_added = add;
+  if (vio_map_depth_positive == 0)
+  {
+    vio_map_u_min = vio_map_u_max = vio_map_v_min = vio_map_v_max = vio_map_z_min = vio_map_z_max = 0.0;
+  }
 
   // double t_b2 = omp_get_wtime() - t0;
 
   printf("[ VIO ] Append %d new visual map points\n", add);
+  printf("[VIO_MAP_STATS] frame=%d pg_size=%zu normal_zero=%zu in_frame=%zu grid_map_skip=%zu selected_scan=%zu "
+         "voxel_candidates=%zu selected_voxel=%zu added=%zu depth_positive=%zu shi_max=%.3f "
+         "u_min=%.3f u_max=%.3f v_min=%.3f v_max=%.3f z_min=%.3f z_max=%.3f\n",
+         frame_count, vio_map_pg_size, vio_map_normal_zero, vio_map_in_frame, vio_map_grid_map_skip, vio_map_selected_from_scan,
+         vio_map_voxel_candidates, vio_map_selected_from_voxel, vio_map_added, vio_map_depth_positive, vio_map_shi_max, vio_map_u_min,
+         vio_map_u_max, vio_map_v_min, vio_map_v_max, vio_map_z_min, vio_map_z_max);
   // printf("pg.size: %d \n", pg.size());
   // printf("B1. : %.6lf \n", t_b1);
   // printf("B2. : %.6lf \n", t_b2);
@@ -1494,11 +1598,21 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       H_T_H.setZero();
       G.setZero();
       H_T_H.block<6, 6>(0, 0) = H_sub_T * H_sub;
-      MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
-      auto &&HTz = H_sub_T * z;
+      Eigen::Matrix<double, 6, 6> pose_info = H_T_H.block<6, 6>(0, 0);
+      Eigen::Matrix<double, 6, 1> pose_rhs = H_sub_T * z;
+      if (saif_gate_en)
+      {
+        const SaifGateStats saif_stats = applySaifGate(pose_info, pose_rhs, saif_min_sqrt_info, saif_min_weight);
+        H_T_H.block<6, 6>(0, 0) = pose_info;
+        saif_gated_dirs += saif_stats.gated_dirs;
+        saif_frame_min_weight = std::min(saif_frame_min_weight, saif_stats.min_weight);
+        saif_frame_weight_sum += saif_stats.weight_sum / 6.0;
+        saif_frame_samples++;
+      }
       auto vec = (*state_propagat) - (*state);
+      MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
       G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
-      auto solution = -K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+      auto solution = -K_1.block<DIM_STATE, 6>(0, 0) * pose_rhs + vec - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
       (*state) += solution;
       auto &&rot_add = solution.block<3, 1>(0, 0);
       auto &&t_add = solution.block<3, 1>(3, 0);
@@ -1866,6 +1980,21 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Current Total Time", t7 - t1 - (t5 - t4));
   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Average Total Time", ave_total);
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+  printf("[VIO_STATS] frame=%d sparse_map_size=%zu total_points=%d inverse_composition=%d ref_patch_cache=%d "
+         "vio_saif_enabled=%d vio_saif_gated_dirs=%zu vio_saif_min_weight=%.6f vio_saif_weight_avg=%.6f "
+         "retrieve_time=%.6f compute_update_time=%.6f compute_jacobian_time=%.6f update_ekf_time=%.6f "
+         "generate_points_time=%.6f plot_time=%.6f update_points_time=%.6f update_ref_patch_time=%.6f "
+         "total_time=%.6f avg_total_time=%.6f "
+         "vio_map_pg_size=%zu vio_map_normal_zero=%zu vio_map_in_frame=%zu vio_map_grid_map_skip=%zu "
+         "vio_map_selected_scan=%zu vio_map_voxel_candidates=%zu vio_map_selected_voxel=%zu vio_map_added=%zu "
+         "vio_map_depth_positive=%zu vio_map_shi_max=%.3f "
+         "vio_map_u_min=%.3f vio_map_u_max=%.3f vio_map_v_min=%.3f vio_map_v_max=%.3f vio_map_z_min=%.3f vio_map_z_max=%.3f\n",
+         frame_count, feat_map.size(), total_points, inverse_composition_en ? 1 : 0, has_ref_patch_cache ? 1 : 0, saif_gate_en ? 1 : 0,
+         saif_gated_dirs, saif_frame_min_weight, saif_frame_weight_avg, t2 - t1, t3 - t2,
+         compute_jacobian_time, update_ekf_time, t4 - t3, t5 - t4, t6 - t5, t7 - t6, t7 - t1 - (t5 - t4), ave_total,
+         vio_map_pg_size, vio_map_normal_zero, vio_map_in_frame, vio_map_grid_map_skip, vio_map_selected_from_scan, vio_map_voxel_candidates,
+         vio_map_selected_from_voxel, vio_map_added, vio_map_depth_positive, vio_map_shi_max, vio_map_u_min, vio_map_u_max, vio_map_v_min,
+         vio_map_v_max, vio_map_z_min, vio_map_z_max);
 
   // std::string text = std::to_string(int(1 / (t7 - t1 - (t5 - t4)))) + " HZ";
   // cv::Point2f origin;

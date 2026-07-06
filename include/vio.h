@@ -99,6 +99,7 @@ public:
   vector<float> patch_buffer;
   bool normal_en, inverse_composition_en, exposure_estimate_en, raycast_en, has_ref_patch_cache;
   bool ncc_en = false, colmap_output_en = false;
+  bool saif_gate_en = false;
 
   int width, height, grid_n_width, grid_n_height, length;
   double image_resize_factor;
@@ -107,12 +108,35 @@ public:
   int max_iterations, total_points;
 
   double img_point_cov, outlier_threshold, ncc_thre;
+  double saif_min_sqrt_info = 1.0;
+  double saif_min_weight = 0.0;
   
   SubSparseMap *visual_submap;
   std::vector<std::vector<V3D>> rays_with_sample_points;
 
   double compute_jacobian_time, update_ekf_time;
   double ave_total = 0;
+  size_t saif_gated_dirs = 0;
+  double saif_frame_min_weight = 1.0;
+  double saif_frame_weight_avg = 1.0;
+  double saif_frame_weight_sum = 0.0;
+  size_t saif_frame_samples = 0;
+  size_t vio_map_pg_size = 0;
+  size_t vio_map_normal_zero = 0;
+  size_t vio_map_in_frame = 0;
+  size_t vio_map_grid_map_skip = 0;
+  size_t vio_map_selected_from_scan = 0;
+  size_t vio_map_voxel_candidates = 0;
+  size_t vio_map_selected_from_voxel = 0;
+  size_t vio_map_added = 0;
+  size_t vio_map_depth_positive = 0;
+  double vio_map_shi_max = 0.0;
+  double vio_map_u_min = 0.0;
+  double vio_map_u_max = 0.0;
+  double vio_map_v_min = 0.0;
+  double vio_map_v_max = 0.0;
+  double vio_map_z_min = 0.0;
+  double vio_map_z_max = 0.0;
   // double ave_build_residual_time = 0;
   // double ave_ekf_time = 0;
 
