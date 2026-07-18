@@ -126,6 +126,12 @@ struct ResidualBuildStats
   double lio_info_eig_max = 0.0;
   double lio_info_condition = 0.0;
   int lio_info_weak_dir = -1;
+  double lio_info_weak_vec0 = 0.0;
+  double lio_info_weak_vec1 = 0.0;
+  double lio_info_weak_vec2 = 0.0;
+  double lio_info_weak_vec3 = 0.0;
+  double lio_info_weak_vec4 = 0.0;
+  double lio_info_weak_vec5 = 0.0;
   size_t saif_gated_dirs = 0;
   double saif_min_weight = 1.0;
   double saif_weight_avg = 1.0;

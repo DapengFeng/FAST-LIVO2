@@ -35,8 +35,50 @@ vio:
   normal_en: true
   raycast_en: false
   inverse_composition_en: false
+  photometric_update_en: true
   exposure_estimate_en: true
   inv_expo_cov: 0.1
+
+feature_vio:
+  diagnostic_en: false
+  max_features: 500
+  quality_level: 0.01
+  min_distance: 12.0
+  depth_search_radius: 4
+  inlier_thresh_px: 3.0
+  min_depth: 0.5
+  max_depth: 120.0
+  fb_check_en: true
+  fb_thresh_px: 1.5
+  ransac_en: true
+  lk_window_size: 21
+  lk_max_level: 3
+  lk_pyramid_cache_en: true
+  lk_temporal_cache_en: true
+  depth_image_reuse_en: true
+  ransac_thresh_px: 1.5
+  gate_min_inlier_ratio: 0.35
+  gate_min_inliers: 30
+  dry_run_en: true
+  dry_run_damping: 1.0e-6
+  dry_run_max_condition: 1.0e8
+  update_en: false
+  inekf_update_en: false
+  frame_stride: 1
+  img_point_cov: 100.0
+  adaptive_weight_en: false
+  adaptive_huber_px: 1.5
+  adaptive_depth_sigma_px: 2.0
+  adaptive_min_weight: 0.05
+  update_scale: 1.0
+  max_update_norm: 0.02
+  max_rot_deg: 0.2
+  max_pos_norm: 0.02
+  bias_watchdog_en: false
+  bias_watchdog_window: 200
+  bias_watchdog_min_samples: 30
+  bias_watchdog_max_rot_mean: 1.0e-4
+  bias_watchdog_max_pos_mean: 1.0e-4
 
 sa_livo:
   lio_saif_gate_en: false

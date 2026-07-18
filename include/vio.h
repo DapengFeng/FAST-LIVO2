@@ -16,7 +16,9 @@ which is included as part of this source code package.
 #include "voxel_map.h"
 #include "feature.h"
 #include <opencv2/imgproc/imgproc_c.h>
+#include <opencv2/video/tracking.hpp>
 #include <pcl/filters/voxel_grid.h>
+#include <deque>
 #include <set>
 #include <vikit/math_utils.h>
 #include <vikit/robust_cost.h>
@@ -80,6 +82,14 @@ public:
   }
 };
 
+struct FeatureVioLandmark
+{
+  cv::Point2f px;
+  V3D point_w;
+  double depth = 0.0;
+  double depth_px_dist = 0.0;
+};
+
 class VIOManager
 {
 public:
@@ -100,6 +110,9 @@ public:
   bool normal_en, inverse_composition_en, exposure_estimate_en, raycast_en, has_ref_patch_cache;
   bool ncc_en = false, colmap_output_en = false;
   bool saif_gate_en = false;
+  bool photometric_update_en = true;
+  bool feature_vio_diagnostic_en = false;
+  bool lio_info_valid = false;
 
   int width, height, grid_n_width, grid_n_height, length;
   double image_resize_factor;
@@ -110,6 +123,48 @@ public:
   double img_point_cov, outlier_threshold, ncc_thre;
   double saif_min_sqrt_info = 1.0;
   double saif_min_weight = 0.0;
+  int lio_info_weak_dir = -1;
+  Eigen::Matrix<double, 6, 1> lio_info_weak_vec = Eigen::Matrix<double, 6, 1>::Zero();
+  int feature_vio_max_features = 500;
+  int feature_vio_depth_search_radius = 4;
+  double feature_vio_quality_level = 0.01;
+  double feature_vio_min_distance = 12.0;
+  double feature_vio_inlier_thresh_px = 3.0;
+  double feature_vio_min_depth = 0.5;
+  double feature_vio_max_depth = 120.0;
+  bool feature_vio_fb_check_en = true;
+  bool feature_vio_ransac_en = true;
+  int feature_vio_lk_window_size = 21;
+  int feature_vio_lk_max_level = 3;
+  bool feature_vio_lk_pyramid_cache_en = true;
+  bool feature_vio_lk_temporal_cache_en = true;
+  bool feature_vio_depth_image_reuse_en = true;
+  bool feature_vio_dry_run_en = true;
+  bool feature_vio_update_en = false;
+  bool feature_vio_inekf_update_en = false;
+  int feature_vio_frame_stride = 1;
+  double feature_vio_fb_thresh_px = 1.5;
+  double feature_vio_ransac_thresh_px = 1.5;
+  double feature_vio_gate_min_inlier_ratio = 0.35;
+  double feature_vio_dry_run_damping = 1e-6;
+  double feature_vio_dry_run_max_condition = 1e8;
+  double feature_vio_img_point_cov = 100.0;
+  bool feature_vio_adaptive_weight_en = false;
+  double feature_vio_adaptive_huber_px = 1.5;
+  double feature_vio_adaptive_depth_sigma_px = 2.0;
+  double feature_vio_adaptive_min_weight = 0.05;
+  double feature_vio_adaptive_depth_gate_px = 2.0;
+  double feature_vio_adaptive_depth_scene_gate_px = 1.7;
+  double feature_vio_update_scale = 1.0;
+  double feature_vio_max_update_norm = 0.02;
+  double feature_vio_max_rot_deg = 0.2;
+  double feature_vio_max_pos_norm = 0.02;
+  bool feature_vio_bias_watchdog_en = false;
+  int feature_vio_bias_watchdog_window = 200;
+  int feature_vio_bias_watchdog_min_samples = 30;
+  double feature_vio_bias_watchdog_max_rot_mean = 1e-4;
+  double feature_vio_bias_watchdog_max_pos_mean = 1e-4;
+  int feature_vio_gate_min_inliers = 30;
   
   SubSparseMap *visual_submap;
   std::vector<std::vector<V3D>> rays_with_sample_points;
@@ -137,6 +192,75 @@ public:
   double vio_map_v_max = 0.0;
   double vio_map_z_min = 0.0;
   double vio_map_z_max = 0.0;
+  size_t feature_vio_prev_landmarks = 0;
+  size_t feature_vio_tracked = 0;
+  size_t feature_vio_valid_reproj = 0;
+  size_t feature_vio_inliers = 0;
+  size_t feature_vio_new_features = 0;
+  size_t feature_vio_depth_landmarks = 0;
+  size_t feature_vio_fb_inliers = 0;
+  size_t feature_vio_fb_rejects = 0;
+  bool feature_vio_fb_check_run = false;
+  size_t feature_vio_ransac_inliers = 0;
+  size_t feature_vio_robust_inliers = 0;
+  double feature_vio_reproj_rmse = 0.0;
+  double feature_vio_inlier_ratio = 0.0;
+  double feature_vio_robust_reproj_rmse = 0.0;
+  double feature_vio_robust_inlier_ratio = 0.0;
+  double feature_vio_robust_depth_mean = 0.0;
+  double feature_vio_robust_depth_min = 0.0;
+  double feature_vio_robust_depth_max = 0.0;
+  double feature_vio_robust_ref_depth_mean = 0.0;
+  double feature_vio_robust_depth_px_dist_mean = 0.0;
+  double feature_vio_robust_reproj_bias_u = 0.0;
+  double feature_vio_robust_reproj_bias_v = 0.0;
+  double feature_vio_robust_abs_reproj_mean = 0.0;
+  double feature_vio_mean_parallax = 0.0;
+  size_t feature_vio_solve_points = 0;
+  double feature_vio_dry_run_update_norm = 0.0;
+  double feature_vio_dry_run_rot_deg = 0.0;
+  double feature_vio_dry_run_pos_norm = 0.0;
+  double feature_vio_dry_run_condition = 0.0;
+  double feature_vio_dry_run_eig_min = 0.0;
+  double feature_vio_dry_run_eig_max = 0.0;
+  double feature_vio_weight_mean = 1.0;
+  double feature_vio_weight_min = 1.0;
+  double feature_vio_effective_points = 0.0;
+  double feature_vio_adaptive_depth_scene_sum_ = 0.0;
+  double feature_vio_adaptive_inlier_scene_sum_ = 0.0;
+  size_t feature_vio_adaptive_depth_scene_samples_ = 0;
+  double feature_vio_adaptive_depth_scene_mean = 0.0;
+  double feature_vio_adaptive_inlier_scene_mean = 0.0;
+  double feature_vio_commit_update_norm = 0.0;
+  double feature_vio_commit_rot_deg = 0.0;
+  double feature_vio_commit_pos_norm = 0.0;
+  double feature_vio_commit_rot_x = 0.0;
+  double feature_vio_commit_rot_y = 0.0;
+  double feature_vio_commit_rot_z = 0.0;
+  double feature_vio_commit_pos_x = 0.0;
+  double feature_vio_commit_pos_y = 0.0;
+  double feature_vio_commit_pos_z = 0.0;
+  int feature_vio_lio_weak_dir = -1;
+  double feature_vio_lio_weak_abs_projection = 0.0;
+  double feature_vio_lio_weak_abs_cosine = 0.0;
+  size_t feature_vio_bias_watchdog_samples = 0;
+  double feature_vio_bias_watchdog_rot_mean_norm = 0.0;
+  double feature_vio_bias_watchdog_pos_mean_norm = 0.0;
+  bool feature_vio_bias_watchdog_reject = false;
+  size_t feature_vio_saif_gated_dirs = 0;
+  double feature_vio_saif_min_weight = 1.0;
+  double feature_vio_saif_weight_avg = 1.0;
+  double feature_vio_diag_time = 0.0;
+  double feature_vio_track_time = 0.0;
+  double feature_vio_solve_time = 0.0;
+  double feature_vio_landmark_time = 0.0;
+  double feature_vio_detect_time = 0.0;
+  double feature_vio_depth_project_time = 0.0;
+  double feature_vio_depth_match_time = 0.0;
+  bool feature_vio_gate_pass = false;
+  bool feature_vio_commit_pass = false;
+  int feature_vio_dry_run_status = 0;
+  int feature_vio_commit_status = 0;
   // double ave_build_residual_time = 0;
   // double ave_ekf_time = 0;
 
@@ -152,8 +276,14 @@ public:
   unordered_map<int, Warp *> warp_map;
   vector<VisualPoint *> retrieve_voxel_points;
   vector<pointWithVar> append_voxel_points;
+  vector<FeatureVioLandmark> feature_vio_prev_landmarks_;
+  std::deque<Eigen::Matrix<double, 6, 1>> feature_vio_bias_watchdog_window_;
+  Eigen::Matrix<double, 6, 1> feature_vio_bias_watchdog_sum_ = Eigen::Matrix<double, 6, 1>::Zero();
   FramePtr new_frame_;
-  cv::Mat img_cp, img_rgb, img_test;
+  cv::Mat img_cp, img_rgb, img_test, feature_vio_prev_img_, feature_vio_depth_img_, feature_vio_index_img_;
+  std::vector<cv::Mat> feature_vio_prev_lk_pyramid_;
+  int feature_vio_prev_lk_window_ = 0;
+  int feature_vio_prev_lk_max_level_ = -1;
 
   enum CellType
   {
@@ -175,6 +305,8 @@ public:
   void getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level);
   void computeProjectionJacobian(V3D p, MD(2, 3) & J);
   void computeJacobianAndUpdateEKF(cv::Mat img);
+  void runFeatureVioDiagnostic(const cv::Mat &img, const vector<pointWithVar> &pg);
+  void buildFeatureVioLandmarks(const cv::Mat &img, const vector<pointWithVar> &pg, vector<FeatureVioLandmark> &landmarks);
   void resetGrid();
   void updateVisualMapPoints(cv::Mat img);
   void getWarpMatrixAffine(const vk::AbstractCamera &cam, const Vector2d &px_ref, const Vector3d &f_ref, const double depth_ref, const SE3 &T_cur_ref,

@@ -1897,6 +1897,718 @@ void VIOManager::dumpDataForColmap()
   cnt++;
 }
 
+void VIOManager::buildFeatureVioLandmarks(const cv::Mat &img, const vector<pointWithVar> &pg, vector<FeatureVioLandmark> &landmarks)
+{
+  const double detect_t0 = omp_get_wtime();
+  landmarks.clear();
+  std::vector<cv::Point2f> corners;
+  cv::goodFeaturesToTrack(img, corners, feature_vio_max_features, feature_vio_quality_level, feature_vio_min_distance,
+                          cv::Mat(), 3, false, 0.04);
+  feature_vio_detect_time = omp_get_wtime() - detect_t0;
+  feature_vio_new_features = corners.size();
+  if (corners.empty() || pg.empty()) return;
+
+  const double project_t0 = omp_get_wtime();
+  cv::Mat index_img;
+  if (feature_vio_depth_image_reuse_en)
+  {
+    feature_vio_index_img_.create(height, width, CV_32SC1);
+    feature_vio_index_img_.setTo(-1);
+    index_img = feature_vio_index_img_;
+  }
+  else
+  {
+    index_img = cv::Mat(height, width, CV_32SC1, cv::Scalar(-1));
+  }
+  std::vector<V3D> projected_points;
+  std::vector<float> projected_depths;
+  projected_points.reserve(pg.size());
+  projected_depths.reserve(pg.size());
+
+  for (const pointWithVar &pv : pg)
+  {
+    const V3D pf = new_frame_->w2f(pv.point_w);
+    if (pf[2] < feature_vio_min_depth || pf[2] > feature_vio_max_depth) continue;
+    const V2D px = new_frame_->cam_->world2cam(pf);
+    if (!new_frame_->cam_->isInFrame(px.cast<int>(), border)) continue;
+
+    const int u = static_cast<int>(std::round(px[0]));
+    const int v = static_cast<int>(std::round(px[1]));
+    if (u < 0 || u >= width || v < 0 || v >= height) continue;
+
+    int &point_index = index_img.at<int>(v, u);
+    if (point_index < 0 || pf[2] < projected_depths[point_index])
+    {
+      point_index = static_cast<int>(projected_points.size());
+      projected_points.push_back(pv.point_w);
+      projected_depths.push_back(static_cast<float>(pf[2]));
+    }
+  }
+  feature_vio_depth_project_time = omp_get_wtime() - project_t0;
+
+  const double match_t0 = omp_get_wtime();
+  const int radius = std::max(0, feature_vio_depth_search_radius);
+  landmarks.reserve(corners.size());
+  for (const cv::Point2f &corner : corners)
+  {
+    const int center_u = static_cast<int>(std::round(corner.x));
+    const int center_v = static_cast<int>(std::round(corner.y));
+    int best_idx = -1;
+    int best_dist_sq = std::numeric_limits<int>::max();
+    float best_depth = std::numeric_limits<float>::max();
+
+    for (int dv = -radius; dv <= radius; ++dv)
+    {
+      const int v = center_v + dv;
+      if (v < 0 || v >= height) continue;
+      for (int du = -radius; du <= radius; ++du)
+      {
+        const int u = center_u + du;
+        if (u < 0 || u >= width) continue;
+        const int idx = index_img.at<int>(v, u);
+        if (idx < 0) continue;
+        const int dist_sq = du * du + dv * dv;
+        const float depth = projected_depths[idx];
+        if (dist_sq < best_dist_sq || (dist_sq == best_dist_sq && depth < best_depth))
+        {
+          best_dist_sq = dist_sq;
+          best_depth = depth;
+          best_idx = idx;
+        }
+      }
+    }
+
+    if (best_idx >= 0)
+    {
+      FeatureVioLandmark landmark;
+      landmark.px = corner;
+      landmark.point_w = projected_points[best_idx];
+      landmark.depth = best_depth;
+      landmark.depth_px_dist = std::sqrt(static_cast<double>(best_dist_sq));
+      landmarks.push_back(landmark);
+    }
+  }
+  feature_vio_depth_landmarks = landmarks.size();
+  feature_vio_depth_match_time = omp_get_wtime() - match_t0;
+}
+
+void VIOManager::runFeatureVioDiagnostic(const cv::Mat &img, const vector<pointWithVar> &pg)
+{
+  const double t0 = omp_get_wtime();
+  feature_vio_prev_landmarks = feature_vio_prev_landmarks_.size();
+  feature_vio_tracked = 0;
+  feature_vio_valid_reproj = 0;
+  feature_vio_inliers = 0;
+  feature_vio_new_features = 0;
+  feature_vio_depth_landmarks = 0;
+  feature_vio_fb_inliers = 0;
+  feature_vio_fb_rejects = 0;
+  feature_vio_fb_check_run = false;
+  feature_vio_track_time = 0.0;
+  feature_vio_solve_time = 0.0;
+  feature_vio_landmark_time = 0.0;
+  feature_vio_detect_time = 0.0;
+  feature_vio_depth_project_time = 0.0;
+  feature_vio_depth_match_time = 0.0;
+  feature_vio_ransac_inliers = 0;
+  feature_vio_robust_inliers = 0;
+  feature_vio_reproj_rmse = 0.0;
+  feature_vio_inlier_ratio = 0.0;
+  feature_vio_robust_reproj_rmse = 0.0;
+  feature_vio_robust_inlier_ratio = 0.0;
+  feature_vio_robust_depth_mean = 0.0;
+  feature_vio_robust_depth_min = 0.0;
+  feature_vio_robust_depth_max = 0.0;
+  feature_vio_robust_ref_depth_mean = 0.0;
+  feature_vio_robust_depth_px_dist_mean = 0.0;
+  feature_vio_robust_reproj_bias_u = 0.0;
+  feature_vio_robust_reproj_bias_v = 0.0;
+  feature_vio_robust_abs_reproj_mean = 0.0;
+  feature_vio_mean_parallax = 0.0;
+  feature_vio_solve_points = 0;
+  feature_vio_dry_run_update_norm = 0.0;
+  feature_vio_dry_run_rot_deg = 0.0;
+  feature_vio_dry_run_pos_norm = 0.0;
+  feature_vio_dry_run_condition = 0.0;
+  feature_vio_dry_run_eig_min = 0.0;
+  feature_vio_dry_run_eig_max = 0.0;
+  feature_vio_weight_mean = 1.0;
+  feature_vio_weight_min = 1.0;
+  feature_vio_effective_points = 0.0;
+  feature_vio_adaptive_depth_scene_mean = 0.0;
+  feature_vio_adaptive_inlier_scene_mean = 0.0;
+  feature_vio_commit_update_norm = 0.0;
+  feature_vio_commit_rot_deg = 0.0;
+  feature_vio_commit_pos_norm = 0.0;
+  feature_vio_commit_rot_x = 0.0;
+  feature_vio_commit_rot_y = 0.0;
+  feature_vio_commit_rot_z = 0.0;
+  feature_vio_commit_pos_x = 0.0;
+  feature_vio_commit_pos_y = 0.0;
+  feature_vio_commit_pos_z = 0.0;
+  feature_vio_lio_weak_dir = lio_info_valid ? lio_info_weak_dir : -1;
+  feature_vio_lio_weak_abs_projection = 0.0;
+  feature_vio_lio_weak_abs_cosine = 0.0;
+  feature_vio_bias_watchdog_samples = feature_vio_bias_watchdog_window_.size();
+  feature_vio_bias_watchdog_rot_mean_norm = 0.0;
+  feature_vio_bias_watchdog_pos_mean_norm = 0.0;
+  feature_vio_bias_watchdog_reject = false;
+  feature_vio_saif_gated_dirs = 0;
+  feature_vio_saif_min_weight = 1.0;
+  feature_vio_saif_weight_avg = 1.0;
+  feature_vio_gate_pass = false;
+  feature_vio_commit_pass = false;
+  feature_vio_dry_run_status = feature_vio_dry_run_en ? 2 : 0;
+  feature_vio_commit_status = feature_vio_update_en ? 3 : 2;
+
+  const int lk_window = std::max(3, feature_vio_lk_window_size | 1);
+  const int lk_max_level = std::max(0, feature_vio_lk_max_level);
+  const cv::Size lk_window_size(lk_window, lk_window);
+  std::vector<cv::Mat> cur_pyramid;
+  bool temporal_pyramid_updated = false;
+
+  if (!feature_vio_prev_img_.empty() && !feature_vio_prev_landmarks_.empty())
+  {
+    std::vector<cv::Point2f> prev_px;
+    prev_px.reserve(feature_vio_prev_landmarks_.size());
+    for (const FeatureVioLandmark &landmark : feature_vio_prev_landmarks_)
+    {
+      prev_px.push_back(landmark.px);
+    }
+
+    std::vector<cv::Point2f> cur_px;
+    std::vector<uchar> status;
+    std::vector<float> tracking_error;
+    std::vector<cv::Mat> prev_pyramid;
+    if (feature_vio_lk_pyramid_cache_en)
+    {
+      const bool temporal_cache_valid = feature_vio_lk_temporal_cache_en && !feature_vio_prev_lk_pyramid_.empty() &&
+                                        feature_vio_prev_lk_window_ == lk_window &&
+                                        feature_vio_prev_lk_max_level_ == lk_max_level;
+      if (feature_vio_lk_temporal_cache_en)
+      {
+        cv::buildOpticalFlowPyramid(img, cur_pyramid, lk_window_size, lk_max_level, true, cv::BORDER_REFLECT_101,
+                                    cv::BORDER_CONSTANT, false);
+      }
+      else
+      {
+        cv::buildOpticalFlowPyramid(img, cur_pyramid, lk_window_size, lk_max_level, true);
+      }
+      const std::vector<cv::Mat> *tracking_prev_pyramid = &feature_vio_prev_lk_pyramid_;
+      if (!temporal_cache_valid)
+      {
+        if (feature_vio_lk_temporal_cache_en)
+        {
+          cv::buildOpticalFlowPyramid(feature_vio_prev_img_, prev_pyramid, lk_window_size, lk_max_level, false,
+                                      cv::BORDER_REFLECT_101, cv::BORDER_CONSTANT, false);
+        }
+        else
+        {
+          cv::buildOpticalFlowPyramid(feature_vio_prev_img_, prev_pyramid, lk_window_size, lk_max_level, true);
+        }
+        tracking_prev_pyramid = &prev_pyramid;
+      }
+      cv::calcOpticalFlowPyrLK(*tracking_prev_pyramid, cur_pyramid, prev_px, cur_px, status, tracking_error,
+                               lk_window_size, lk_max_level);
+    }
+    else
+    {
+      cv::calcOpticalFlowPyrLK(feature_vio_prev_img_, img, prev_px, cur_px, status, tracking_error, lk_window_size, lk_max_level);
+    }
+
+    feature_vio_fb_check_run = feature_vio_fb_check_en;
+
+    std::vector<cv::Point2f> back_px;
+    std::vector<uchar> back_status;
+    std::vector<float> back_tracking_error;
+    if (feature_vio_fb_check_run && !cur_px.empty())
+    {
+      if (feature_vio_lk_pyramid_cache_en)
+      {
+        const bool temporal_cache_valid = feature_vio_lk_temporal_cache_en && !feature_vio_prev_lk_pyramid_.empty() &&
+                                          feature_vio_prev_lk_window_ == lk_window &&
+                                          feature_vio_prev_lk_max_level_ == lk_max_level;
+        const std::vector<cv::Mat> &tracking_prev_pyramid = temporal_cache_valid ? feature_vio_prev_lk_pyramid_ : prev_pyramid;
+        cv::calcOpticalFlowPyrLK(cur_pyramid, tracking_prev_pyramid, cur_px, back_px, back_status, back_tracking_error,
+                                 lk_window_size, lk_max_level);
+      }
+      else
+      {
+        cv::calcOpticalFlowPyrLK(img, feature_vio_prev_img_, cur_px, back_px, back_status, back_tracking_error, lk_window_size, lk_max_level);
+      }
+    }
+    if (feature_vio_lk_pyramid_cache_en && feature_vio_lk_temporal_cache_en)
+    {
+      feature_vio_prev_lk_pyramid_.clear();
+      feature_vio_prev_lk_pyramid_.reserve((cur_pyramid.size() + 1) / 2);
+      for (size_t level_idx = 0; level_idx < cur_pyramid.size(); level_idx += 2)
+      {
+        feature_vio_prev_lk_pyramid_.push_back(cur_pyramid[level_idx]);
+      }
+      cur_pyramid.clear();
+      feature_vio_prev_lk_window_ = lk_window;
+      feature_vio_prev_lk_max_level_ = lk_max_level;
+      temporal_pyramid_updated = true;
+    }
+    feature_vio_track_time = omp_get_wtime() - t0;
+
+    struct FeatureVioCandidate
+    {
+      cv::Point2f prev_px;
+      cv::Point2f cur_px;
+      V3D point_w = V3D::Zero();
+      double reproj_error_sq = 0.0;
+      double reproj_error_u = 0.0;
+      double reproj_error_v = 0.0;
+      double ref_depth = 0.0;
+      double cur_depth = 0.0;
+      double depth_px_dist = 0.0;
+    };
+    std::vector<FeatureVioCandidate> candidates;
+    std::vector<cv::Point2f> ransac_prev_px;
+    std::vector<cv::Point2f> ransac_cur_px;
+    candidates.reserve(cur_px.size());
+    ransac_prev_px.reserve(cur_px.size());
+    ransac_cur_px.reserve(cur_px.size());
+
+    double reproj_error_sq_sum = 0.0;
+    double parallax_sum = 0.0;
+    for (size_t i = 0; i < cur_px.size(); ++i)
+    {
+      if (!status[i]) continue;
+      const cv::Point2f &tracked_px = cur_px[i];
+      if (tracked_px.x < border || tracked_px.x >= width - border || tracked_px.y < border || tracked_px.y >= height - border) continue;
+      feature_vio_tracked++;
+      const cv::Point2f delta = tracked_px - prev_px[i];
+      parallax_sum += std::sqrt(delta.x * delta.x + delta.y * delta.y);
+
+      const V3D pf = new_frame_->w2f(feature_vio_prev_landmarks_[i].point_w);
+      if (pf[2] <= feature_vio_min_depth || pf[2] > feature_vio_max_depth) continue;
+      const V2D reproj = new_frame_->w2c(feature_vio_prev_landmarks_[i].point_w);
+      if (!new_frame_->cam_->isInFrame(reproj.cast<int>(), border)) continue;
+
+      const double du = tracked_px.x - reproj[0];
+      const double dv = tracked_px.y - reproj[1];
+      const double err_sq = du * du + dv * dv;
+      reproj_error_sq_sum += err_sq;
+      feature_vio_valid_reproj++;
+      if (std::sqrt(err_sq) <= feature_vio_inlier_thresh_px) feature_vio_inliers++;
+
+      bool fb_ok = true;
+      if (feature_vio_fb_check_run)
+      {
+        fb_ok = false;
+        if (i < back_status.size() && back_status[i])
+        {
+          const cv::Point2f fb_delta = back_px[i] - prev_px[i];
+          const double fb_err = std::sqrt(fb_delta.x * fb_delta.x + fb_delta.y * fb_delta.y);
+          fb_ok = fb_err <= feature_vio_fb_thresh_px;
+        }
+      }
+
+      if (fb_ok)
+      {
+        feature_vio_fb_inliers++;
+        FeatureVioCandidate candidate;
+        candidate.prev_px = prev_px[i];
+        candidate.cur_px = tracked_px;
+        candidate.point_w = feature_vio_prev_landmarks_[i].point_w;
+        candidate.reproj_error_sq = err_sq;
+        candidate.reproj_error_u = du;
+        candidate.reproj_error_v = dv;
+        candidate.ref_depth = feature_vio_prev_landmarks_[i].depth;
+        candidate.cur_depth = pf[2];
+        candidate.depth_px_dist = feature_vio_prev_landmarks_[i].depth_px_dist;
+        candidates.push_back(candidate);
+        ransac_prev_px.push_back(prev_px[i]);
+        ransac_cur_px.push_back(tracked_px);
+      }
+      else
+      {
+        feature_vio_fb_rejects++;
+      }
+    }
+
+    if (feature_vio_valid_reproj > 0)
+    {
+      feature_vio_reproj_rmse = std::sqrt(reproj_error_sq_sum / static_cast<double>(feature_vio_valid_reproj));
+      feature_vio_inlier_ratio = static_cast<double>(feature_vio_inliers) / static_cast<double>(feature_vio_valid_reproj);
+    }
+    if (feature_vio_tracked > 0)
+    {
+      feature_vio_mean_parallax = parallax_sum / static_cast<double>(feature_vio_tracked);
+    }
+
+    std::vector<uchar> ransac_mask(candidates.size(), 1);
+    if (feature_vio_ransac_en)
+    {
+      ransac_mask.assign(candidates.size(), 0);
+      if (candidates.size() >= 8)
+      {
+        cv::Mat ransac_cv_mask;
+        const cv::Mat fundamental = cv::findFundamentalMat(ransac_prev_px, ransac_cur_px, cv::FM_RANSAC, feature_vio_ransac_thresh_px, 0.99, ransac_cv_mask);
+        if (!fundamental.empty() && static_cast<size_t>(ransac_cv_mask.rows) == candidates.size())
+        {
+          for (size_t i = 0; i < candidates.size(); ++i)
+          {
+            ransac_mask[i] = ransac_cv_mask.at<uchar>(static_cast<int>(i), 0) != 0;
+          }
+        }
+      }
+    }
+
+    double robust_reproj_error_sq_sum = 0.0;
+    double robust_reproj_error_sum_u = 0.0;
+    double robust_reproj_error_sum_v = 0.0;
+    double robust_abs_reproj_sum = 0.0;
+    double robust_depth_sum = 0.0;
+    double robust_ref_depth_sum = 0.0;
+    double robust_depth_px_dist_sum = 0.0;
+    double robust_depth_min = std::numeric_limits<double>::max();
+    double robust_depth_max = 0.0;
+    std::vector<FeatureVioCandidate> robust_candidates;
+    robust_candidates.reserve(candidates.size());
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+      if (!ransac_mask[i]) continue;
+      feature_vio_ransac_inliers++;
+      if (std::sqrt(candidates[i].reproj_error_sq) > feature_vio_inlier_thresh_px) continue;
+      robust_reproj_error_sq_sum += candidates[i].reproj_error_sq;
+      robust_reproj_error_sum_u += candidates[i].reproj_error_u;
+      robust_reproj_error_sum_v += candidates[i].reproj_error_v;
+      robust_abs_reproj_sum += std::sqrt(candidates[i].reproj_error_sq);
+      robust_depth_sum += candidates[i].cur_depth;
+      robust_ref_depth_sum += candidates[i].ref_depth;
+      robust_depth_px_dist_sum += candidates[i].depth_px_dist;
+      robust_depth_min = std::min(robust_depth_min, candidates[i].cur_depth);
+      robust_depth_max = std::max(robust_depth_max, candidates[i].cur_depth);
+      feature_vio_robust_inliers++;
+      robust_candidates.push_back(candidates[i]);
+    }
+    if (feature_vio_valid_reproj > 0)
+    {
+      feature_vio_robust_inlier_ratio = static_cast<double>(feature_vio_robust_inliers) / static_cast<double>(feature_vio_valid_reproj);
+    }
+    if (feature_vio_robust_inliers > 0)
+    {
+      const double inv_robust_count = 1.0 / static_cast<double>(feature_vio_robust_inliers);
+      feature_vio_robust_reproj_rmse = std::sqrt(robust_reproj_error_sq_sum * inv_robust_count);
+      feature_vio_robust_depth_mean = robust_depth_sum * inv_robust_count;
+      feature_vio_robust_depth_min = robust_depth_min;
+      feature_vio_robust_depth_max = robust_depth_max;
+      feature_vio_robust_ref_depth_mean = robust_ref_depth_sum * inv_robust_count;
+      feature_vio_robust_depth_px_dist_mean = robust_depth_px_dist_sum * inv_robust_count;
+      feature_vio_robust_reproj_bias_u = robust_reproj_error_sum_u * inv_robust_count;
+      feature_vio_robust_reproj_bias_v = robust_reproj_error_sum_v * inv_robust_count;
+      feature_vio_robust_abs_reproj_mean = robust_abs_reproj_sum * inv_robust_count;
+    }
+    feature_vio_gate_pass = feature_vio_robust_inliers >= static_cast<size_t>(std::max(0, feature_vio_gate_min_inliers)) &&
+                            feature_vio_robust_inlier_ratio >= feature_vio_gate_min_inlier_ratio;
+    if (feature_vio_gate_pass && feature_vio_robust_inliers > 0)
+    {
+      feature_vio_adaptive_depth_scene_sum_ += feature_vio_robust_depth_px_dist_mean;
+      feature_vio_adaptive_inlier_scene_sum_ += feature_vio_robust_inlier_ratio;
+      feature_vio_adaptive_depth_scene_samples_++;
+    }
+    if (feature_vio_adaptive_depth_scene_samples_ > 0)
+    {
+      const double scene_samples = static_cast<double>(feature_vio_adaptive_depth_scene_samples_);
+      feature_vio_adaptive_depth_scene_mean = feature_vio_adaptive_depth_scene_sum_ / scene_samples;
+      feature_vio_adaptive_inlier_scene_mean = feature_vio_adaptive_inlier_scene_sum_ / scene_samples;
+    }
+
+    if (feature_vio_dry_run_en)
+    {
+      if (!feature_vio_gate_pass)
+      {
+        feature_vio_dry_run_status = 2;
+      }
+      else if (robust_candidates.size() < 6)
+      {
+        feature_vio_dry_run_status = 3;
+      }
+      else
+      {
+        Eigen::Matrix<double, 6, 6> HtH = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> Htr = Eigen::Matrix<double, 6, 1>::Zero();
+        Eigen::Matrix<double, 6, 1> solution = Eigen::Matrix<double, 6, 1>::Zero();
+        M3D Rwi(state->rot_end);
+        V3D Pwi(state->pos_end);
+        Rcw = Rci * Rwi.transpose();
+        Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
+        Jdp_dt = Rci * Rwi.transpose();
+        double weight_sum = 0.0;
+        double min_weight = 1.0;
+
+        for (const FeatureVioCandidate &candidate : robust_candidates)
+        {
+          const V3D pf = Rcw * candidate.point_w + Pcw;
+          if (pf[2] <= feature_vio_min_depth || pf[2] > feature_vio_max_depth) continue;
+          feature_vio_solve_points++;
+          const V2D projected_px = cam->world2cam(pf);
+          MD(2, 3) Jdpi;
+          computeProjectionJacobian(pf, Jdpi);
+          M3D p_hat;
+          p_hat << SKEW_SYM_MATRX(pf);
+          const MD(2, 3) Jdphi = Jdpi * p_hat;
+          const MD(2, 3) Jdp = -Jdpi;
+          const MD(2, 3) JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
+          const MD(2, 3) Jdt = Jdp * Jdp_dt;
+          Eigen::Matrix<double, 2, 6> H_i;
+          H_i << JdR, Jdt;
+          Eigen::Matrix<double, 2, 1> residual;
+          residual << projected_px[0] - candidate.cur_px.x, projected_px[1] - candidate.cur_px.y;
+          double weight = 1.0;
+          const bool adaptive_scene_gate_pass = feature_vio_adaptive_depth_scene_gate_px > 0.0 &&
+                                                feature_vio_adaptive_depth_scene_mean >= feature_vio_adaptive_depth_scene_gate_px;
+          const bool adaptive_frame_gate_pass = feature_vio_adaptive_depth_gate_px <= 0.0 ||
+                                                feature_vio_robust_depth_px_dist_mean >= feature_vio_adaptive_depth_gate_px;
+          const bool adaptive_weight_run = feature_vio_adaptive_weight_en &&
+                                           (adaptive_scene_gate_pass || adaptive_frame_gate_pass);
+          if (adaptive_weight_run)
+          {
+            const double residual_norm = residual.norm();
+            const double huber_px = std::max(feature_vio_adaptive_huber_px, std::numeric_limits<double>::epsilon());
+            const double huber_weight = residual_norm <= huber_px ? 1.0 : huber_px / residual_norm;
+            const double depth_sigma_px =
+                std::max(feature_vio_adaptive_depth_sigma_px, std::numeric_limits<double>::epsilon());
+            const double normalized_depth_distance = candidate.depth_px_dist / depth_sigma_px;
+            const double depth_weight = std::exp(-0.5 * normalized_depth_distance * normalized_depth_distance);
+            const double min_adaptive_weight = std::min(1.0, std::max(0.0, feature_vio_adaptive_min_weight));
+            weight = std::max(min_adaptive_weight, huber_weight * depth_weight);
+          }
+          HtH.noalias() += weight * H_i.transpose() * H_i;
+          Htr.noalias() += weight * H_i.transpose() * residual;
+          weight_sum += weight;
+          min_weight = std::min(min_weight, weight);
+        }
+
+        if (feature_vio_solve_points > 0)
+        {
+          feature_vio_weight_mean = weight_sum / static_cast<double>(feature_vio_solve_points);
+          feature_vio_weight_min = min_weight;
+          feature_vio_effective_points = weight_sum;
+        }
+
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eigensolver(HtH);
+        if (eigensolver.info() != Eigen::Success)
+        {
+          feature_vio_dry_run_status = 4;
+        }
+        else
+        {
+          feature_vio_dry_run_eig_min = std::max(0.0, eigensolver.eigenvalues()[0]);
+          feature_vio_dry_run_eig_max = std::max(0.0, eigensolver.eigenvalues()[5]);
+          const double denom = std::max(feature_vio_dry_run_eig_min, feature_vio_dry_run_damping);
+          feature_vio_dry_run_condition = feature_vio_dry_run_eig_max / denom;
+          if (feature_vio_dry_run_condition > feature_vio_dry_run_max_condition || feature_vio_dry_run_eig_max <= 0.0)
+          {
+            feature_vio_dry_run_status = 4;
+          }
+          else
+          {
+            HtH.diagonal().array() += feature_vio_dry_run_damping;
+            solution = -HtH.ldlt().solve(Htr);
+            feature_vio_dry_run_update_norm = solution.norm();
+            feature_vio_dry_run_rot_deg = solution.block<3, 1>(0, 0).norm() * 57.29577951308232;
+            feature_vio_dry_run_pos_norm = solution.block<3, 1>(3, 0).norm();
+            feature_vio_dry_run_status = 1;
+
+            if (feature_vio_update_en)
+            {
+              Eigen::Matrix<double, 6, 1> commit_solution = solution;
+              Eigen::Matrix<double, DIM_STATE, DIM_STATE> feature_gain = Eigen::Matrix<double, DIM_STATE, DIM_STATE>::Zero();
+              bool update_covariance = false;
+              if (feature_vio_inekf_update_en)
+              {
+                Eigen::Matrix<double, 6, 6> pose_info = HtH;
+                Eigen::Matrix<double, 6, 1> pose_rhs = Htr;
+                if (saif_gate_en)
+                {
+                  const SaifGateStats saif_stats = applySaifGate(pose_info, pose_rhs, saif_min_sqrt_info, saif_min_weight);
+                  feature_vio_saif_gated_dirs = saif_stats.gated_dirs;
+                  feature_vio_saif_min_weight = saif_stats.min_weight;
+                  feature_vio_saif_weight_avg = saif_stats.weight_sum / 6.0;
+                }
+
+                Eigen::Matrix<double, DIM_STATE, DIM_STATE> feature_info = Eigen::Matrix<double, DIM_STATE, DIM_STATE>::Zero();
+                feature_info.block<6, 6>(0, 0) = pose_info;
+                const double pixel_cov = std::max(feature_vio_img_point_cov, std::numeric_limits<double>::epsilon());
+                const Eigen::Matrix<double, DIM_STATE, DIM_STATE> prior_info = (state->cov / pixel_cov).inverse();
+                const Eigen::Matrix<double, DIM_STATE, DIM_STATE> K_1 = (feature_info + prior_info).inverse();
+                const Eigen::Matrix<double, DIM_STATE, 6> K_pose = K_1.block<DIM_STATE, 6>(0, 0);
+                const Eigen::Matrix<double, DIM_STATE, 1> ekf_solution = -K_pose * pose_rhs;
+                commit_solution = ekf_solution.block<6, 1>(0, 0);
+                feature_gain.block<DIM_STATE, 6>(0, 0) = K_pose * pose_info;
+                update_covariance = feature_vio_update_scale >= 0.0 && feature_vio_update_scale <= 1.0;
+              }
+
+              const Eigen::Matrix<double, 6, 1> scaled_solution = feature_vio_update_scale * commit_solution;
+              feature_vio_commit_update_norm = scaled_solution.norm();
+              feature_vio_commit_rot_deg = scaled_solution.block<3, 1>(0, 0).norm() * 57.29577951308232;
+              feature_vio_commit_pos_norm = scaled_solution.block<3, 1>(3, 0).norm();
+              feature_vio_commit_rot_x = scaled_solution[0];
+              feature_vio_commit_rot_y = scaled_solution[1];
+              feature_vio_commit_rot_z = scaled_solution[2];
+              feature_vio_commit_pos_x = scaled_solution[3];
+              feature_vio_commit_pos_y = scaled_solution[4];
+              feature_vio_commit_pos_z = scaled_solution[5];
+              if (lio_info_valid)
+              {
+                const double update_norm = std::max(feature_vio_commit_update_norm, std::numeric_limits<double>::epsilon());
+                const double weak_norm = std::max(lio_info_weak_vec.norm(), std::numeric_limits<double>::epsilon());
+                feature_vio_lio_weak_dir = lio_info_weak_dir;
+                feature_vio_lio_weak_abs_projection = std::abs(scaled_solution.dot(lio_info_weak_vec) / weak_norm);
+                feature_vio_lio_weak_abs_cosine = feature_vio_lio_weak_abs_projection / update_norm;
+              }
+              if (feature_vio_commit_update_norm > feature_vio_max_update_norm)
+              {
+                feature_vio_commit_status = 4;
+              }
+              else if (feature_vio_commit_rot_deg > feature_vio_max_rot_deg)
+              {
+                feature_vio_commit_status = 5;
+              }
+              else if (feature_vio_commit_pos_norm > feature_vio_max_pos_norm)
+              {
+                feature_vio_commit_status = 6;
+              }
+              else if (feature_vio_bias_watchdog_en)
+              {
+                const int window_size = std::max(1, feature_vio_bias_watchdog_window);
+                feature_vio_bias_watchdog_window_.push_back(scaled_solution);
+                feature_vio_bias_watchdog_sum_ += scaled_solution;
+                while (static_cast<int>(feature_vio_bias_watchdog_window_.size()) > window_size)
+                {
+                  feature_vio_bias_watchdog_sum_ -= feature_vio_bias_watchdog_window_.front();
+                  feature_vio_bias_watchdog_window_.pop_front();
+                }
+
+                feature_vio_bias_watchdog_samples = feature_vio_bias_watchdog_window_.size();
+                const double inv_samples = 1.0 / static_cast<double>(feature_vio_bias_watchdog_samples);
+                const Eigen::Matrix<double, 6, 1> mean_update = feature_vio_bias_watchdog_sum_ * inv_samples;
+                feature_vio_bias_watchdog_rot_mean_norm = mean_update.block<3, 1>(0, 0).norm();
+                feature_vio_bias_watchdog_pos_mean_norm = mean_update.block<3, 1>(3, 0).norm();
+                const bool has_enough_samples =
+                    feature_vio_bias_watchdog_samples >= static_cast<size_t>(std::max(1, feature_vio_bias_watchdog_min_samples));
+                feature_vio_bias_watchdog_reject =
+                    has_enough_samples &&
+                    (feature_vio_bias_watchdog_rot_mean_norm > feature_vio_bias_watchdog_max_rot_mean ||
+                     feature_vio_bias_watchdog_pos_mean_norm > feature_vio_bias_watchdog_max_pos_mean);
+                if (feature_vio_bias_watchdog_reject)
+                {
+                  feature_vio_commit_status = 7;
+                }
+                else
+                {
+                  Eigen::Matrix<double, DIM_STATE, 1> state_update = Eigen::Matrix<double, DIM_STATE, 1>::Zero();
+                  state_update.block<6, 1>(0, 0) = scaled_solution;
+                  (*state) += state_update;
+                  if (feature_vio_inekf_update_en && update_covariance)
+                  {
+                    const Eigen::Matrix<double, DIM_STATE, DIM_STATE> I_STATE =
+                        Eigen::Matrix<double, DIM_STATE, DIM_STATE>::Identity();
+                    state->cov = (I_STATE - feature_vio_update_scale * feature_gain) * state->cov;
+                  }
+                  updateFrameState(*state);
+                  feature_vio_commit_pass = true;
+                  feature_vio_commit_status = 1;
+                }
+              }
+              else
+              {
+                Eigen::Matrix<double, DIM_STATE, 1> state_update = Eigen::Matrix<double, DIM_STATE, 1>::Zero();
+                state_update.block<6, 1>(0, 0) = scaled_solution;
+                (*state) += state_update;
+                if (feature_vio_inekf_update_en && update_covariance)
+                {
+                  const Eigen::Matrix<double, DIM_STATE, DIM_STATE> I_STATE =
+                      Eigen::Matrix<double, DIM_STATE, DIM_STATE>::Identity();
+                  state->cov = (I_STATE - feature_vio_update_scale * feature_gain) * state->cov;
+                }
+                updateFrameState(*state);
+                feature_vio_commit_pass = true;
+                feature_vio_commit_status = 1;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  feature_vio_solve_time = omp_get_wtime() - t0 - feature_vio_track_time;
+  const double landmark_t0 = omp_get_wtime();
+  std::vector<FeatureVioLandmark> next_landmarks;
+  buildFeatureVioLandmarks(img, pg, next_landmarks);
+  feature_vio_landmark_time = omp_get_wtime() - landmark_t0;
+  feature_vio_prev_landmarks_.swap(next_landmarks);
+  if (feature_vio_lk_pyramid_cache_en && feature_vio_lk_temporal_cache_en)
+  {
+    if (!temporal_pyramid_updated)
+    {
+      cv::buildOpticalFlowPyramid(img, cur_pyramid, lk_window_size, lk_max_level, false, cv::BORDER_REFLECT_101,
+                                  cv::BORDER_CONSTANT, false);
+      feature_vio_prev_lk_pyramid_.swap(cur_pyramid);
+      feature_vio_prev_lk_window_ = lk_window;
+      feature_vio_prev_lk_max_level_ = lk_max_level;
+    }
+  }
+  else
+  {
+    feature_vio_prev_lk_pyramid_.clear();
+    feature_vio_prev_lk_window_ = 0;
+    feature_vio_prev_lk_max_level_ = -1;
+  }
+  feature_vio_prev_img_ = img.clone();
+  feature_vio_diag_time = omp_get_wtime() - t0;
+
+  printf("[FEATURE_VIO_STATS] frame=%d enabled=%d prev_landmarks=%zu tracked=%zu valid_reproj=%zu inliers=%zu "
+         "inlier_ratio=%.6f reproj_rmse=%.6f mean_parallax=%.6f fb_check_run=%d fb_inliers=%zu fb_rejects=%zu "
+         "ransac_inliers=%zu robust_inliers=%zu robust_inlier_ratio=%.6f robust_reproj_rmse=%.6f gate_pass=%d "
+         "robust_depth_mean=%.6f robust_depth_min=%.6f robust_depth_max=%.6f robust_ref_depth_mean=%.6f "
+         "robust_depth_px_dist_mean=%.6f robust_reproj_bias_u=%.6f robust_reproj_bias_v=%.6f robust_abs_reproj_mean=%.6f "
+         "solve_points=%zu dry_run_status=%d dry_run_update_norm=%.9f dry_run_rot_deg=%.9f dry_run_pos_norm=%.9f "
+         "dry_run_condition=%.6f dry_run_eig_min=%.9f dry_run_eig_max=%.9f "
+         "update_en=%d inekf_update_en=%d img_point_cov=%.6f "
+         "adaptive_depth_scene_mean=%.6f adaptive_inlier_scene_mean=%.6f "
+         "adaptive_scene_samples=%zu adaptive_weight_en=%d "
+         "adaptive_weight_mean=%.6f adaptive_weight_min=%.6f adaptive_effective_points=%.6f update_scale=%.6f "
+         "feature_vio_saif_enabled=%d feature_vio_saif_gated_dirs=%zu feature_vio_saif_min_weight=%.6f feature_vio_saif_weight_avg=%.6f "
+         "commit_status=%d commit_pass=%d commit_update_norm=%.9f commit_rot_deg=%.9f commit_pos_norm=%.9f "
+         "commit_rot_x=%.9f commit_rot_y=%.9f commit_rot_z=%.9f commit_pos_x=%.9f commit_pos_y=%.9f commit_pos_z=%.9f "
+         "lio_weak_dir=%d lio_weak_abs_projection=%.9f lio_weak_abs_cosine=%.9f "
+         "bias_watchdog_en=%d bias_watchdog_samples=%zu bias_watchdog_rot_mean_norm=%.9f bias_watchdog_pos_mean_norm=%.9f "
+         "bias_watchdog_reject=%d "
+         "new_features=%zu depth_landmarks=%zu depth_ratio=%.6f track_time=%.6f solve_time=%.6f "
+         "landmark_time=%.6f detect_time=%.6f depth_project_time=%.6f depth_match_time=%.6f diag_time=%.6f\n",
+         frame_count, feature_vio_diagnostic_en ? 1 : 0, feature_vio_prev_landmarks, feature_vio_tracked, feature_vio_valid_reproj,
+         feature_vio_inliers, feature_vio_inlier_ratio, feature_vio_reproj_rmse, feature_vio_mean_parallax,
+         feature_vio_fb_check_run ? 1 : 0, feature_vio_fb_inliers,
+         feature_vio_fb_rejects, feature_vio_ransac_inliers, feature_vio_robust_inliers, feature_vio_robust_inlier_ratio,
+         feature_vio_robust_reproj_rmse, feature_vio_gate_pass ? 1 : 0, feature_vio_robust_depth_mean, feature_vio_robust_depth_min,
+         feature_vio_robust_depth_max, feature_vio_robust_ref_depth_mean, feature_vio_robust_depth_px_dist_mean,
+         feature_vio_robust_reproj_bias_u, feature_vio_robust_reproj_bias_v, feature_vio_robust_abs_reproj_mean,
+         feature_vio_solve_points, feature_vio_dry_run_status, feature_vio_dry_run_update_norm,
+         feature_vio_dry_run_rot_deg, feature_vio_dry_run_pos_norm, feature_vio_dry_run_condition, feature_vio_dry_run_eig_min,
+         feature_vio_dry_run_eig_max, feature_vio_update_en ? 1 : 0, feature_vio_inekf_update_en ? 1 : 0,
+         feature_vio_img_point_cov, feature_vio_adaptive_depth_scene_mean, feature_vio_adaptive_inlier_scene_mean,
+         feature_vio_adaptive_depth_scene_samples_,
+         feature_vio_adaptive_weight_en ? 1 : 0, feature_vio_weight_mean,
+         feature_vio_weight_min, feature_vio_effective_points, feature_vio_update_scale, saif_gate_en ? 1 : 0,
+         feature_vio_saif_gated_dirs,
+         feature_vio_saif_min_weight, feature_vio_saif_weight_avg, feature_vio_commit_status,
+         feature_vio_commit_pass ? 1 : 0, feature_vio_commit_update_norm, feature_vio_commit_rot_deg, feature_vio_commit_pos_norm,
+         feature_vio_commit_rot_x, feature_vio_commit_rot_y, feature_vio_commit_rot_z, feature_vio_commit_pos_x, feature_vio_commit_pos_y,
+         feature_vio_commit_pos_z, feature_vio_lio_weak_dir, feature_vio_lio_weak_abs_projection, feature_vio_lio_weak_abs_cosine,
+         feature_vio_bias_watchdog_en ? 1 : 0, feature_vio_bias_watchdog_samples,
+         feature_vio_bias_watchdog_rot_mean_norm, feature_vio_bias_watchdog_pos_mean_norm, feature_vio_bias_watchdog_reject ? 1 : 0,
+         feature_vio_new_features, feature_vio_depth_landmarks,
+         feature_vio_new_features > 0 ? static_cast<double>(feature_vio_depth_landmarks) / static_cast<double>(feature_vio_new_features) : 0.0,
+         feature_vio_track_time, feature_vio_solve_time, feature_vio_landmark_time, feature_vio_detect_time,
+         feature_vio_depth_project_time, feature_vio_depth_match_time, feature_vio_diag_time);
+}
+
 void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time)
 {
   if (width != img.cols || height != img.rows)
@@ -1914,36 +2626,51 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   updateFrameState(*state);
   
   resetGrid();
+  compute_jacobian_time = update_ekf_time = 0.0;
+  saif_gated_dirs = 0;
+  saif_frame_min_weight = 1.0;
+  saif_frame_weight_avg = 1.0;
+
+  const int feature_stride = std::max(1, feature_vio_frame_stride);
+  const bool feature_vio_run = feature_vio_diagnostic_en && frame_count % feature_stride == 0;
+  if (feature_vio_run)
+  {
+    runFeatureVioDiagnostic(img, pg);
+  }
+  else
+  {
+    feature_vio_diag_time = 0.0;
+  }
 
   double t1 = omp_get_wtime();
 
-  retrieveFromVisualSparseMap(img, pg, feat_map);
+  if (photometric_update_en) retrieveFromVisualSparseMap(img, pg, feat_map);
 
   double t2 = omp_get_wtime();
 
-  computeJacobianAndUpdateEKF(img);
+  if (photometric_update_en) computeJacobianAndUpdateEKF(img);
 
   double t3 = omp_get_wtime();
 
-  generateVisualMapPoints(img, pg);
+  if (photometric_update_en) generateVisualMapPoints(img, pg);
 
   double t4 = omp_get_wtime();
   
-  plotTrackedPoints();
+  if (photometric_update_en) plotTrackedPoints();
 
-  if (plot_flag) projectPatchFromRefToCur(feat_map);
+  if (photometric_update_en && plot_flag) projectPatchFromRefToCur(feat_map);
 
   double t5 = omp_get_wtime();
 
-  updateVisualMapPoints(img);
+  if (photometric_update_en) updateVisualMapPoints(img);
 
   double t6 = omp_get_wtime();
 
-  updateReferencePatch(feat_map);
+  if (photometric_update_en) updateReferencePatch(feat_map);
 
   double t7 = omp_get_wtime();
   
-  if(colmap_output_en)  dumpDataForColmap();
+  if(photometric_update_en && colmap_output_en)  dumpDataForColmap();
 
   frame_count++;
   ave_total = ave_total * (frame_count - 1) / frame_count + (t7 - t1 - (t5 - t4)) / frame_count;
@@ -1980,18 +2707,22 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Current Total Time", t7 - t1 - (t5 - t4));
   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Average Total Time", ave_total);
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("[VIO_STATS] frame=%d sparse_map_size=%zu total_points=%d inverse_composition=%d ref_patch_cache=%d "
+  printf("[VIO_STATS] frame=%d sparse_map_size=%zu total_points=%d inverse_composition=%d photometric_update=%d "
+         "feature_vio_diag=%d feature_vio_run=%d feature_vio_stride=%d feature_vio_time=%.6f ref_patch_cache=%d "
          "vio_saif_enabled=%d vio_saif_gated_dirs=%zu vio_saif_min_weight=%.6f vio_saif_weight_avg=%.6f "
          "retrieve_time=%.6f compute_update_time=%.6f compute_jacobian_time=%.6f update_ekf_time=%.6f "
          "generate_points_time=%.6f plot_time=%.6f update_points_time=%.6f update_ref_patch_time=%.6f "
-         "total_time=%.6f avg_total_time=%.6f "
+         "total_time=%.6f total_with_feature_time=%.6f avg_total_time=%.6f "
          "vio_map_pg_size=%zu vio_map_normal_zero=%zu vio_map_in_frame=%zu vio_map_grid_map_skip=%zu "
          "vio_map_selected_scan=%zu vio_map_voxel_candidates=%zu vio_map_selected_voxel=%zu vio_map_added=%zu "
          "vio_map_depth_positive=%zu vio_map_shi_max=%.3f "
          "vio_map_u_min=%.3f vio_map_u_max=%.3f vio_map_v_min=%.3f vio_map_v_max=%.3f vio_map_z_min=%.3f vio_map_z_max=%.3f\n",
-         frame_count, feat_map.size(), total_points, inverse_composition_en ? 1 : 0, has_ref_patch_cache ? 1 : 0, saif_gate_en ? 1 : 0,
+         frame_count, feat_map.size(), total_points, inverse_composition_en ? 1 : 0, photometric_update_en ? 1 : 0,
+         feature_vio_diagnostic_en ? 1 : 0, feature_vio_run ? 1 : 0, feature_stride, feature_vio_diag_time,
+         has_ref_patch_cache ? 1 : 0, saif_gate_en ? 1 : 0,
          saif_gated_dirs, saif_frame_min_weight, saif_frame_weight_avg, t2 - t1, t3 - t2,
-         compute_jacobian_time, update_ekf_time, t4 - t3, t5 - t4, t6 - t5, t7 - t6, t7 - t1 - (t5 - t4), ave_total,
+         compute_jacobian_time, update_ekf_time, t4 - t3, t5 - t4, t6 - t5, t7 - t6, t7 - t1 - (t5 - t4),
+         feature_vio_diag_time + t7 - t1 - (t5 - t4), ave_total,
          vio_map_pg_size, vio_map_normal_zero, vio_map_in_frame, vio_map_grid_map_skip, vio_map_selected_from_scan, vio_map_voxel_candidates,
          vio_map_selected_from_voxel, vio_map_added, vio_map_depth_positive, vio_map_shi_max, vio_map_u_min, vio_map_u_max, vio_map_v_min,
          vio_map_v_max, vio_map_z_min, vio_map_z_max);

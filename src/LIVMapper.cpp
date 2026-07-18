@@ -150,11 +150,53 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
 
   nh.param<bool>("vio/normal_en", normal_en, true);
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
+  nh.param<bool>("vio/photometric_update_en", photometric_update_en, true);
   nh.param<int>("vio/max_iterations", max_iterations, 5);
   nh.param<double>("vio/img_point_cov", IMG_POINT_COV, 100);
   nh.param<bool>("vio/raycast_en", raycast_en, false);
   nh.param<bool>("vio/exposure_estimate_en", exposure_estimate_en, true);
   nh.param<double>("vio/inv_expo_cov", inv_expo_cov, 0.2);
+  nh.param<bool>("feature_vio/diagnostic_en", feature_vio_diagnostic_en, false);
+  nh.param<int>("feature_vio/max_features", feature_vio_max_features, 500);
+  nh.param<int>("feature_vio/depth_search_radius", feature_vio_depth_search_radius, 4);
+  nh.param<double>("feature_vio/quality_level", feature_vio_quality_level, 0.01);
+  nh.param<double>("feature_vio/min_distance", feature_vio_min_distance, 12.0);
+  nh.param<double>("feature_vio/inlier_thresh_px", feature_vio_inlier_thresh_px, 3.0);
+  nh.param<double>("feature_vio/min_depth", feature_vio_min_depth, 0.5);
+  nh.param<double>("feature_vio/max_depth", feature_vio_max_depth, 120.0);
+  nh.param<bool>("feature_vio/fb_check_en", feature_vio_fb_check_en, true);
+  nh.param<bool>("feature_vio/ransac_en", feature_vio_ransac_en, true);
+  nh.param<int>("feature_vio/lk_window_size", feature_vio_lk_window_size, 21);
+  nh.param<int>("feature_vio/lk_max_level", feature_vio_lk_max_level, 3);
+  nh.param<bool>("feature_vio/lk_pyramid_cache_en", feature_vio_lk_pyramid_cache_en, true);
+  nh.param<bool>("feature_vio/lk_temporal_cache_en", feature_vio_lk_temporal_cache_en, true);
+  nh.param<bool>("feature_vio/depth_image_reuse_en", feature_vio_depth_image_reuse_en, true);
+  nh.param<double>("feature_vio/fb_thresh_px", feature_vio_fb_thresh_px, 1.5);
+  nh.param<double>("feature_vio/ransac_thresh_px", feature_vio_ransac_thresh_px, 1.5);
+  nh.param<double>("feature_vio/gate_min_inlier_ratio", feature_vio_gate_min_inlier_ratio, 0.35);
+  nh.param<bool>("feature_vio/dry_run_en", feature_vio_dry_run_en, true);
+  nh.param<double>("feature_vio/dry_run_damping", feature_vio_dry_run_damping, 1e-6);
+  nh.param<double>("feature_vio/dry_run_max_condition", feature_vio_dry_run_max_condition, 1e8);
+  nh.param<bool>("feature_vio/update_en", feature_vio_update_en, false);
+  nh.param<bool>("feature_vio/inekf_update_en", feature_vio_inekf_update_en, false);
+  nh.param<int>("feature_vio/frame_stride", feature_vio_frame_stride, 1);
+  nh.param<double>("feature_vio/img_point_cov", feature_vio_img_point_cov, 100.0);
+  nh.param<bool>("feature_vio/adaptive_weight_en", feature_vio_adaptive_weight_en, false);
+  nh.param<double>("feature_vio/adaptive_huber_px", feature_vio_adaptive_huber_px, 1.5);
+  nh.param<double>("feature_vio/adaptive_depth_sigma_px", feature_vio_adaptive_depth_sigma_px, 2.0);
+  nh.param<double>("feature_vio/adaptive_min_weight", feature_vio_adaptive_min_weight, 0.05);
+  nh.param<double>("feature_vio/adaptive_depth_gate_px", feature_vio_adaptive_depth_gate_px, 2.0);
+  nh.param<double>("feature_vio/adaptive_depth_scene_gate_px", feature_vio_adaptive_depth_scene_gate_px, 1.7);
+  nh.param<double>("feature_vio/update_scale", feature_vio_update_scale, 1.0);
+  nh.param<double>("feature_vio/max_update_norm", feature_vio_max_update_norm, 0.02);
+  nh.param<double>("feature_vio/max_rot_deg", feature_vio_max_rot_deg, 0.2);
+  nh.param<double>("feature_vio/max_pos_norm", feature_vio_max_pos_norm, 0.02);
+  nh.param<bool>("feature_vio/bias_watchdog_en", feature_vio_bias_watchdog_en, false);
+  nh.param<int>("feature_vio/bias_watchdog_window", feature_vio_bias_watchdog_window, 200);
+  nh.param<int>("feature_vio/bias_watchdog_min_samples", feature_vio_bias_watchdog_min_samples, 30);
+  nh.param<double>("feature_vio/bias_watchdog_max_rot_mean", feature_vio_bias_watchdog_max_rot_mean, 1e-4);
+  nh.param<double>("feature_vio/bias_watchdog_max_pos_mean", feature_vio_bias_watchdog_max_pos_mean, 1e-4);
+  nh.param<int>("feature_vio/gate_min_inliers", feature_vio_gate_min_inliers, 30);
   nh.param<bool>("sa_livo/vio_saif_gate_en", vio_saif_gate_en, false);
   nh.param<double>("sa_livo/vio_saif_min_sqrt_info", vio_saif_min_sqrt_info, 1.0);
   nh.param<double>("sa_livo/vio_saif_min_weight", vio_saif_min_weight, 0.0);
@@ -233,6 +275,48 @@ void LIVMapper::initializeComponents()
   vio_manager->img_point_cov = IMG_POINT_COV;
   vio_manager->normal_en = normal_en;
   vio_manager->inverse_composition_en = inverse_composition_en;
+  vio_manager->photometric_update_en = photometric_update_en;
+  vio_manager->feature_vio_diagnostic_en = feature_vio_diagnostic_en;
+  vio_manager->feature_vio_max_features = feature_vio_max_features;
+  vio_manager->feature_vio_depth_search_radius = feature_vio_depth_search_radius;
+  vio_manager->feature_vio_quality_level = feature_vio_quality_level;
+  vio_manager->feature_vio_min_distance = feature_vio_min_distance;
+  vio_manager->feature_vio_inlier_thresh_px = feature_vio_inlier_thresh_px;
+  vio_manager->feature_vio_min_depth = feature_vio_min_depth;
+  vio_manager->feature_vio_max_depth = feature_vio_max_depth;
+  vio_manager->feature_vio_fb_check_en = feature_vio_fb_check_en;
+  vio_manager->feature_vio_ransac_en = feature_vio_ransac_en;
+  vio_manager->feature_vio_lk_window_size = feature_vio_lk_window_size;
+  vio_manager->feature_vio_lk_max_level = feature_vio_lk_max_level;
+  vio_manager->feature_vio_lk_pyramid_cache_en = feature_vio_lk_pyramid_cache_en;
+  vio_manager->feature_vio_lk_temporal_cache_en = feature_vio_lk_temporal_cache_en;
+  vio_manager->feature_vio_depth_image_reuse_en = feature_vio_depth_image_reuse_en;
+  vio_manager->feature_vio_fb_thresh_px = feature_vio_fb_thresh_px;
+  vio_manager->feature_vio_ransac_thresh_px = feature_vio_ransac_thresh_px;
+  vio_manager->feature_vio_gate_min_inlier_ratio = feature_vio_gate_min_inlier_ratio;
+  vio_manager->feature_vio_dry_run_en = feature_vio_dry_run_en;
+  vio_manager->feature_vio_dry_run_damping = feature_vio_dry_run_damping;
+  vio_manager->feature_vio_dry_run_max_condition = feature_vio_dry_run_max_condition;
+  vio_manager->feature_vio_update_en = feature_vio_update_en;
+  vio_manager->feature_vio_inekf_update_en = feature_vio_inekf_update_en;
+  vio_manager->feature_vio_frame_stride = feature_vio_frame_stride;
+  vio_manager->feature_vio_img_point_cov = feature_vio_img_point_cov;
+  vio_manager->feature_vio_adaptive_weight_en = feature_vio_adaptive_weight_en;
+  vio_manager->feature_vio_adaptive_huber_px = feature_vio_adaptive_huber_px;
+  vio_manager->feature_vio_adaptive_depth_sigma_px = feature_vio_adaptive_depth_sigma_px;
+  vio_manager->feature_vio_adaptive_min_weight = feature_vio_adaptive_min_weight;
+  vio_manager->feature_vio_adaptive_depth_gate_px = feature_vio_adaptive_depth_gate_px;
+  vio_manager->feature_vio_adaptive_depth_scene_gate_px = feature_vio_adaptive_depth_scene_gate_px;
+  vio_manager->feature_vio_update_scale = feature_vio_update_scale;
+  vio_manager->feature_vio_max_update_norm = feature_vio_max_update_norm;
+  vio_manager->feature_vio_max_rot_deg = feature_vio_max_rot_deg;
+  vio_manager->feature_vio_max_pos_norm = feature_vio_max_pos_norm;
+  vio_manager->feature_vio_bias_watchdog_en = feature_vio_bias_watchdog_en;
+  vio_manager->feature_vio_bias_watchdog_window = feature_vio_bias_watchdog_window;
+  vio_manager->feature_vio_bias_watchdog_min_samples = feature_vio_bias_watchdog_min_samples;
+  vio_manager->feature_vio_bias_watchdog_max_rot_mean = feature_vio_bias_watchdog_max_rot_mean;
+  vio_manager->feature_vio_bias_watchdog_max_pos_mean = feature_vio_bias_watchdog_max_pos_mean;
+  vio_manager->feature_vio_gate_min_inliers = feature_vio_gate_min_inliers;
   vio_manager->saif_gate_en = vio_saif_gate_en;
   vio_manager->saif_min_sqrt_info = vio_saif_min_sqrt_info;
   vio_manager->saif_min_weight = vio_saif_min_weight;
@@ -576,6 +660,10 @@ void LIVMapper::handleLIO()
 
   const ResidualBuildStats residual_stats = voxelmap_manager->last_residual_stats();
   const PlaneBuildStats plane_stats = voxelmap_manager->last_plane_build_stats();
+  vio_manager->lio_info_valid = residual_stats.lio_info_weak_dir >= 0 && residual_stats.lio_info_eig_max > 0.0;
+  vio_manager->lio_info_weak_dir = residual_stats.lio_info_weak_dir;
+  vio_manager->lio_info_weak_vec << residual_stats.lio_info_weak_vec0, residual_stats.lio_info_weak_vec1, residual_stats.lio_info_weak_vec2,
+      residual_stats.lio_info_weak_vec3, residual_stats.lio_info_weak_vec4, residual_stats.lio_info_weak_vec5;
   printf("[ALG_STATS] frame=%d | points raw_points=%zu down_points=%d residual_input=%zu residual_success=%zu success_rate=%.6f "
          "| search map_hits=%zu primary_queries=%zu neighbor_queries=%zu neighbor_hits=%zu octree_nodes=%zu avg_nodes_per_input=%.6f "
          "plane_candidates=%zu avg_planes_per_input=%.6f | rejects range_rejects=%zu sigma_rejects=%zu "
@@ -594,6 +682,7 @@ void LIVMapper::handleLIO()
          "plane_accepted_kappa_avg=%.6e plane_ratio_rejected_kappa_avg=%.6e plane_min_eigen_avg=%.6e "
          "plane_min_eigen_min=%.6e plane_min_eigen_max=%.6e | info eig0=%.6e eig1=%.6e eig2=%.6e "
          "eig3=%.6e eig4=%.6e eig5=%.6e eig_min=%.6e eig_max=%.6e info_condition=%.6e weak_dir=%d "
+         "weak_vec0=%.6e weak_vec1=%.6e weak_vec2=%.6e weak_vec3=%.6e weak_vec4=%.6e weak_vec5=%.6e "
          "| saif lio_saif_enabled=%d lio_saif_gated_dirs=%zu lio_saif_min_weight=%.6f lio_saif_weight_avg=%.6f "
          "| timing downsample_time=%.6f icp_time=%.6f "
          "update_map_time=%.6f total_time=%.6f\n",
@@ -617,6 +706,8 @@ void LIVMapper::handleLIO()
          residual_stats.lio_info_eig0, residual_stats.lio_info_eig1,
          residual_stats.lio_info_eig2, residual_stats.lio_info_eig3, residual_stats.lio_info_eig4, residual_stats.lio_info_eig5,
          residual_stats.lio_info_eig_min, residual_stats.lio_info_eig_max, residual_stats.lio_info_condition, residual_stats.lio_info_weak_dir,
+         residual_stats.lio_info_weak_vec0, residual_stats.lio_info_weak_vec1, residual_stats.lio_info_weak_vec2,
+         residual_stats.lio_info_weak_vec3, residual_stats.lio_info_weak_vec4, residual_stats.lio_info_weak_vec5,
          voxelmap_manager->config_setting_.saif_gate_en_ ? 1 : 0, residual_stats.saif_gated_dirs, residual_stats.saif_min_weight,
          residual_stats.saif_weight_avg,
          t_down - t0, t2 - t1, t4 - t3, t4 - t0);

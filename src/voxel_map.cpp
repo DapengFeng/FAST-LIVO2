@@ -503,6 +503,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   double adaptive_plane_point_score_bonus_sum = 0.0;
   double planarity_score_penalty_sum = 0.0;
   Eigen::Matrix<double, 6, 1> lio_info_eigs = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Matrix<double, 6, 1> lio_info_weak_vec = Eigen::Matrix<double, 6, 1>::Zero();
   double lio_info_condition = 0.0;
   int lio_info_weak_dir = -1;
   size_t saif_gated_dirs = 0;
@@ -660,6 +661,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       {
         lio_info_eigs = lio_info_solver.eigenvalues();
         lio_info_eigs.minCoeff(&lio_info_weak_dir);
+        lio_info_weak_vec = lio_info_solver.eigenvectors().col(lio_info_weak_dir);
         const double eig_min_abs = std::max(std::abs(lio_info_eigs(0)), std::numeric_limits<double>::epsilon());
         lio_info_condition = std::abs(lio_info_eigs(5)) / eig_min_abs;
       }
@@ -736,6 +738,12 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   last_residual_stats_.lio_info_eig_max = lio_info_eigs(5);
   last_residual_stats_.lio_info_condition = lio_info_condition;
   last_residual_stats_.lio_info_weak_dir = lio_info_weak_dir;
+  last_residual_stats_.lio_info_weak_vec0 = lio_info_weak_vec(0);
+  last_residual_stats_.lio_info_weak_vec1 = lio_info_weak_vec(1);
+  last_residual_stats_.lio_info_weak_vec2 = lio_info_weak_vec(2);
+  last_residual_stats_.lio_info_weak_vec3 = lio_info_weak_vec(3);
+  last_residual_stats_.lio_info_weak_vec4 = lio_info_weak_vec(4);
+  last_residual_stats_.lio_info_weak_vec5 = lio_info_weak_vec(5);
   last_residual_stats_.saif_gated_dirs = saif_gated_dirs;
   last_residual_stats_.saif_min_weight = saif_min_weight;
   last_residual_stats_.saif_weight_avg = saif_samples > 0 ? saif_weight_sum / static_cast<double>(saif_samples) : 1.0;

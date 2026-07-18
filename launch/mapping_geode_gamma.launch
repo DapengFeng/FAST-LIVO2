@@ -1,8 +1,88 @@
 <launch>
 <!-- LIO-only baseline for GEODE Livox bags. -->
   <arg name="rviz" default="true" />
+	<arg name="photometric_update_en" default="true" />
+	<arg name="img_time_offset" default="0.0" />
+	<arg name="feature_vio_diagnostic_en" default="false" />
+	<arg name="feature_vio_max_features" default="500" />
+	<arg name="feature_vio_inlier_thresh_px" default="3.0" />
+	<arg name="feature_vio_update_en" default="false" />
+	<arg name="feature_vio_inekf_update_en" default="false" />
+	<arg name="feature_vio_frame_stride" default="1" />
+	<arg name="feature_vio_fb_check_en" default="true" />
+	<arg name="feature_vio_ransac_en" default="true" />
+	<arg name="feature_vio_lk_window_size" default="21" />
+	<arg name="feature_vio_lk_max_level" default="3" />
+	<arg name="feature_vio_lk_pyramid_cache_en" default="true" />
+	<arg name="feature_vio_lk_temporal_cache_en" default="true" />
+	<arg name="feature_vio_depth_image_reuse_en" default="true" />
+	<arg name="feature_vio_img_point_cov" default="100.0" />
+	<arg name="feature_vio_adaptive_weight_en" default="false" />
+	<arg name="feature_vio_adaptive_huber_px" default="1.5" />
+	<arg name="feature_vio_adaptive_depth_sigma_px" default="2.0" />
+	<arg name="feature_vio_adaptive_min_weight" default="0.05" />
+	<arg name="feature_vio_adaptive_depth_gate_px" default="2.0" />
+	<arg name="feature_vio_adaptive_depth_scene_gate_px" default="1.7" />
+	<arg name="feature_vio_bias_watchdog_en" default="false" />
+	<arg name="feature_vio_bias_watchdog_window" default="200" />
+	<arg name="feature_vio_bias_watchdog_min_samples" default="30" />
+	<arg name="feature_vio_bias_watchdog_max_rot_mean" default="0.0001" />
+	<arg name="feature_vio_bias_watchdog_max_pos_mean" default="0.0001" />
+	<arg name="lio_saif_gate_en" default="false" />
+	<arg name="lio_saif_min_sqrt_info" default="1.0" />
+	<arg name="lio_saif_min_weight" default="0.0" />
+	<arg name="lio_adaptive_correspondence_refresh_en" default="false" />
+	<arg name="lio_adaptive_success_rate_drop" default="0.03" />
+	<arg name="lio_adaptive_residual_ratio" default="1.25" />
+	<arg name="lio_info_eigen_log_en" default="false" />
+	<arg name="lio_adaptive_plane_point_score_en" default="false" />
+	<arg name="lio_adaptive_plane_score_margin" default="0.05" />
+	<arg name="lio_adaptive_plane_point_score_weight" default="0.0" />
+	<arg name="lio_adaptive_plane_min_points" default="20" />
+	<arg name="lio_dept_err" default="0.02" />
+	<arg name="lio_beam_err" default="0.05" />
 
 	<rosparam command="load" file="$(find fast_livo)/config/geode_gamma.yaml" />
+	<param name="vio/photometric_update_en" value="$(arg photometric_update_en)" />
+	<param name="time_offset/img_time_offset" value="$(arg img_time_offset)" />
+	<param name="feature_vio/diagnostic_en" value="$(arg feature_vio_diagnostic_en)" />
+	<param name="feature_vio/max_features" value="$(arg feature_vio_max_features)" />
+	<param name="feature_vio/inlier_thresh_px" value="$(arg feature_vio_inlier_thresh_px)" />
+	<param name="feature_vio/update_en" value="$(arg feature_vio_update_en)" />
+	<param name="feature_vio/inekf_update_en" value="$(arg feature_vio_inekf_update_en)" />
+	<param name="feature_vio/frame_stride" value="$(arg feature_vio_frame_stride)" />
+	<param name="feature_vio/fb_check_en" value="$(arg feature_vio_fb_check_en)" />
+	<param name="feature_vio/ransac_en" value="$(arg feature_vio_ransac_en)" />
+	<param name="feature_vio/lk_window_size" value="$(arg feature_vio_lk_window_size)" />
+	<param name="feature_vio/lk_max_level" value="$(arg feature_vio_lk_max_level)" />
+	<param name="feature_vio/lk_pyramid_cache_en" value="$(arg feature_vio_lk_pyramid_cache_en)" />
+	<param name="feature_vio/lk_temporal_cache_en" value="$(arg feature_vio_lk_temporal_cache_en)" />
+	<param name="feature_vio/depth_image_reuse_en" value="$(arg feature_vio_depth_image_reuse_en)" />
+	<param name="feature_vio/img_point_cov" value="$(arg feature_vio_img_point_cov)" />
+	<param name="feature_vio/adaptive_weight_en" value="$(arg feature_vio_adaptive_weight_en)" />
+	<param name="feature_vio/adaptive_huber_px" value="$(arg feature_vio_adaptive_huber_px)" />
+	<param name="feature_vio/adaptive_depth_sigma_px" value="$(arg feature_vio_adaptive_depth_sigma_px)" />
+	<param name="feature_vio/adaptive_min_weight" value="$(arg feature_vio_adaptive_min_weight)" />
+	<param name="feature_vio/adaptive_depth_gate_px" value="$(arg feature_vio_adaptive_depth_gate_px)" />
+	<param name="feature_vio/adaptive_depth_scene_gate_px" value="$(arg feature_vio_adaptive_depth_scene_gate_px)" />
+	<param name="feature_vio/bias_watchdog_en" value="$(arg feature_vio_bias_watchdog_en)" />
+	<param name="feature_vio/bias_watchdog_window" value="$(arg feature_vio_bias_watchdog_window)" />
+	<param name="feature_vio/bias_watchdog_min_samples" value="$(arg feature_vio_bias_watchdog_min_samples)" />
+	<param name="feature_vio/bias_watchdog_max_rot_mean" value="$(arg feature_vio_bias_watchdog_max_rot_mean)" />
+	<param name="feature_vio/bias_watchdog_max_pos_mean" value="$(arg feature_vio_bias_watchdog_max_pos_mean)" />
+	<param name="sa_livo/lio_saif_gate_en" value="$(arg lio_saif_gate_en)" />
+	<param name="sa_livo/lio_saif_min_sqrt_info" value="$(arg lio_saif_min_sqrt_info)" />
+	<param name="sa_livo/lio_saif_min_weight" value="$(arg lio_saif_min_weight)" />
+	<param name="lio/adaptive_correspondence_refresh_en" value="$(arg lio_adaptive_correspondence_refresh_en)" />
+	<param name="lio/adaptive_success_rate_drop" value="$(arg lio_adaptive_success_rate_drop)" />
+	<param name="lio/adaptive_residual_ratio" value="$(arg lio_adaptive_residual_ratio)" />
+	<param name="lio/info_eigen_log_en" value="$(arg lio_info_eigen_log_en)" />
+	<param name="lio/adaptive_plane_point_score_en" value="$(arg lio_adaptive_plane_point_score_en)" />
+	<param name="lio/adaptive_plane_score_margin" value="$(arg lio_adaptive_plane_score_margin)" />
+	<param name="lio/adaptive_plane_point_score_weight" value="$(arg lio_adaptive_plane_point_score_weight)" />
+	<param name="lio/adaptive_plane_min_points" value="$(arg lio_adaptive_plane_min_points)" />
+	<param name="lio/dept_err" value="$(arg lio_dept_err)" />
+	<param name="lio/beam_err" value="$(arg lio_beam_err)" />
 
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
 		<rosparam file="$(find fast_livo)/config/camera_geode.yaml" />
